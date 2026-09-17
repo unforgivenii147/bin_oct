@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3, rrs, unique_path
+from dh import cprint, fsz, get_files, gsz, mpf, rrs, unique_path
 
 try:
     import cv2
@@ -85,7 +85,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)
     diffsize = before - gsz(cwd)
     cprint(f"space freed: {fsz(diffsize)}")
 

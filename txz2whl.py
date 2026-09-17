@@ -6,7 +6,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-from dh import get_files, mpf3, unique_path
+from dh import get_files, mpf, unique_path
 
 
 def process_file(path: str | Path) -> None:
@@ -48,7 +48,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

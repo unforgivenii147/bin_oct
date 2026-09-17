@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, get_nobinary, mpf3
+from dh import cprint, get_nobinary, mpf
 
 
 def process_file(path: str | Path) -> None:
@@ -34,7 +34,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

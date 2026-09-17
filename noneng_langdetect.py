@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dh import get_nobinary, mpf3
+from dh import get_nobinary, mpf
 from langdetect import DetectorFactory, detect
 from langdetect.lang_detect_exception import LangDetectException
 
@@ -28,7 +28,7 @@ def process_file(path) -> bool | None:
 def main() -> None:
     cwd = Path.cwd()
     files = get_nobinary(cwd)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

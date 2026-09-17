@@ -6,7 +6,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 from bs4.element import PageElement
-from dh import cprint, get_files, get_random_filename, mpf3
+from dh import cprint, get_files, get_random_filename, mpf
 
 
 def save_style(str1: list[PageElement]) -> None:
@@ -46,7 +46,7 @@ def main() -> None:
     files = (
         [Path(arg) for arg in args] if args else get_files(cwd, ext=[".html", ".htm"])
     )
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

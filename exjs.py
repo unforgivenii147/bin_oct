@@ -6,7 +6,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 from bs4.element import PageElement
-from dh import cprint, get_files, get_random_filename, mpf3
+from dh import cprint, get_files, get_random_filename, mpf
 
 MAX_QUEUE = 16
 
@@ -44,7 +44,7 @@ def main() -> None:
     cwd = Path.cwd()
     args = sys.argv[1:]
     files = [Path(f) for f in args] if args else get_files(cwd, ext=[".html", "htm"])
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

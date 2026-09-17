@@ -10,7 +10,7 @@ from PIL import Image
 from pytesseract import image_to_string
 
 
-def mpf3(process_function: Callable, files: list[Path], **kwargs):
+def mpf(process_function: Callable, files: list[Path], **kwargs):
     from joblib import Parallel, delayed
 
     file_strings = [str(f) for f in files]
@@ -88,7 +88,7 @@ def main() -> None:
         process_file(files[0])
     else:
         print(f"Using {max_workers} worker(s) for memory safety...")
-        mpf3(process_file, files)
+        mpf(process_file, files)
 
 
 if __name__ == "__main__":

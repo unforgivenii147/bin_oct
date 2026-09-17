@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf3
+from dh import get_files, mpf
 
 
 def process_file(path) -> None:
@@ -31,7 +31,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf3(process_file, files)
+    mpf(process_file, files)
     stubless = []
     for f in files:
         stubpath = f.with_suffix(".pyi")

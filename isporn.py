@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dh import cprint, get_files, mpf3
+from dh import cprint, get_files, mpf
 from nudenet import NudeDetector
 
 safe_path = Path("safe")
@@ -36,4 +36,4 @@ def process_file(path) -> None:
 if __name__ == "__main__":
     cwd = Path.cwd()
     files = get_files(cwd, ext=[".jpg", ".jpeg", ".png", ".webp"])
-    mpf3(process_file, files)
+    mpf(process_file, files)

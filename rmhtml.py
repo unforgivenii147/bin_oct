@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3
+from dh import cprint, fsz, get_files, gsz, mpf
 
 MAX_QUEUE = 8
 
@@ -34,7 +34,7 @@ def main() -> None:
         if args
         else get_files(cwd, ext=[".html", ".htm", ".xml"])
     )
-    mpf3(process_file, files)
+    mpf(process_file, files)
     diff_size = before - gsz(cwd)
     print(f"space saved : {fsz(diff_size)}")
 

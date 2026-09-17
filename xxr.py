@@ -17,7 +17,7 @@ from pathlib import Path
 import brotlicffi as brotli
 import py7zr
 import zstandard as zstd
-from dh import cprint, fsz, gsz, mpf3
+from dh import cprint, fsz, gsz, mpf
 from loguru import logger
 
 SUPPORTED_EXTS = {
@@ -387,7 +387,7 @@ def main() -> None:
             print("No compressed files found to decompress.")
             return
         print(f"Found {len(targets)} compressed files. Starting decompression...")
-        mpf3(decompress_one, [str(t) for t in targets], max_workers=args.threads)
+        mpf(decompress_one, [str(t) for t in targets], max_workers=args.threads)
     else:
         mode_map = {
             "use_7z": "7z",
@@ -409,7 +409,7 @@ def main() -> None:
             f"Found {len(items_to_process)} items to compress using mode '{mode}'. Starting compression..."
         )
         COMPRESS_MODE = mode
-        mpf3(worker_func, items_to_process, max_workers=args.threads)
+        mpf(worker_func, items_to_process, max_workers=args.threads)
     after = gsz(cwd)
     space_freed = before - after
     if space_freed <= 0:

@@ -5,7 +5,7 @@ import sys
 from functools import partial
 from pathlib import Path
 
-from dh import mpf3, unique_path
+from dh import mpf, unique_path
 
 
 def rename_item_to_lowercase(
@@ -69,7 +69,7 @@ def main() -> None:
     process_func_with_flags = partial(
         rename_item_to_lowercase, dry_run=dry_run, verbose=verbose
     )
-    results = mpf3(process_func_with_flags, paths_to_process)
+    results = mpf(process_func_with_flags, paths_to_process)
     if dry_run:
         print("--- DRY RUN COMPLETE ---")
     else:

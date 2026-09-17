@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import mpf_async, unique_path
+from dh import mpf, unique_path
 
 
 def process_file(path) -> None:
@@ -31,4 +31,4 @@ if __name__ == "__main__":
         if not args
         else [p for p in cwd.rglob("*") if ".git" not in p.parts and not p.is_symlink()]
     )
-    mpf_async(process_file, files)
+    mpf(process_file, files)

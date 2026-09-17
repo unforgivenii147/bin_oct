@@ -1,76 +1,121 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
+"""Find files listed by `dpkg -L` that are missing on disk: enumerate installed packages with `dpkg -l`, verify each package's files in a multiprocessing pool of 8 workers via `Pool.starmap`, skip `share/man|info|doc|LICENSES` paths, and write `missing_files.json` and `missing.txt` using loguru for progress."""
 
 import json
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing.pool import Pool
 from pathlib import Path
+from typing import Final
+
+from loguru import logger
+
+MAX_WORKERS: Final[int] = 8
+DPKG_TIMEOUT_SECONDS: Final[int] = 5
+IGNORED_SHARE_SUBDIRS: Final[frozenset[str]] = frozenset(
+    {"man", "info", "doc", "LICENSES"}
+)
+DEFAULT_OUTPUT_NAME: Final[str] = "missing_files.json"
+MISSING_TXT_NAME: Final[str] = "missing.txt"
 
 
-def should_ignore(path):
-    parts = Path(path).parts
-    return any(
-        len(parts) > i + 1 and parts[i : i + 2][1] in {"man", "info", "doc", "LICENSES"}
-        for i in range(len(parts) - 1)
-        if parts[i] == "share"
-    )
+def should_ignore(file_path: str) -> bool:
+    """Return ``True`` for paths under `share/man`, `share/info`, `share/doc`, or `share/LICENSES`."""
+    parts: tuple[str, ...] = Path(file_path).parts
+    for i in range(len(parts) - 1):
+        if parts[i] == "share" and parts[i + 1] in IGNORED_SHARE_SUBDIRS:
+            return True
+    return False
 
 
-def check_package_files(pkg_name):
+def check_package_files(pkg_name: str) -> tuple[str, list[str] | None]:
+    """Return ``(package, missing_files_or_None)`` for a single dpkg package.
+
+    ``None`` means either the package has no missing files or its listing
+    could not be obtained.
+    """
     try:
-        result = subprocess.run(
+        result: subprocess.CompletedProcess[str] = subprocess.run(
             ["dpkg", "-L", pkg_name],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=DPKG_TIMEOUT_SECONDS,
             check=False,
         )
         if result.returncode != 0:
             return pkg_name, None
-        missing = []
-        for path in result.stdout.strip().split("\n"):
-            if not path or should_ignore(path):
+
+        missing: list[str] = []
+        for file_path in result.stdout.strip().split("\n"):
+            if not file_path or should_ignore(file_path):
                 continue
-            p = Path(path)
+            p: Path = Path(file_path)
             if p.is_dir():
                 continue
             if not p.exists():
-                missing.append(path)
+                missing.append(file_path)
+
         return pkg_name, missing if missing else None
-    except (subprocess.TimeoutExpired, Exception):
+    except subprocess.TimeoutExpired:
+        return pkg_name, None
+    except Exception as e:
+        logger.warning("Error checking {}: {}", pkg_name, e)
         return pkg_name, None
 
 
-def main():
-    output_file = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("missing_files.json")
-    result = subprocess.run(["dpkg", "-l"], capture_output=True, text=True, check=False)
-    packages = [
-        line.split()[1] for line in result.stdout.split("\n") if line.startswith("ii")
-    ]
-    print(f"Scanning {len(packages)} packages...")
-    results = {}
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        futures = {executor.submit(check_package_files, pkg): pkg for pkg in packages}
-        for i, future in enumerate(as_completed(futures), 1):
-            pkg, missing = future.result()
+def _list_installed_packages() -> list[str]:
+    """Return the names of all currently installed dpkg packages."""
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ["dpkg", "-l"], capture_output=True, text=True, check=False
+    )
+    packages: list[str] = []
+    for line in result.stdout.split("\n"):
+        if line.startswith("ii"):
+            fields: list[str] = line.split()
+            if len(fields) >= 2:
+                packages.append(fields[1])
+    return packages
+
+
+def main() -> None:
+    """CLI entry point: scan all installed packages and write missing-file reports."""
+    output_file: Path = (
+        Path(sys.argv[1]) if len(sys.argv) > 1 else Path(DEFAULT_OUTPUT_NAME)
+    )
+    missing_txt: Path = Path(MISSING_TXT_NAME)
+
+    packages: list[str] = _list_installed_packages()
+    if not packages:
+        logger.warning("No installed packages found (is dpkg available?)")
+        return
+
+    logger.info("Scanning {} packages with {} workers...", len(packages), MAX_WORKERS)
+
+    jobs: list[tuple[str]] = [(pkg,) for pkg in packages]
+
+    results: dict[str, list[str]] = {}
+    with Pool(processes=MAX_WORKERS) as pool:
+        for i, (pkg, missing) in enumerate(
+            pool.starmap(check_package_files, jobs), start=1
+        ):
             if missing:
                 results[pkg] = missing
             if i % 10 == 0:
-                print(f"  {i}/{len(packages)}")
+                logger.info("  {}/{}", i, len(packages))
+
     try:
-        with open(output_file, "w") as f:
+        with output_file.open("w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
-        with open("missing.txt", "w") as f:
+        with missing_txt.open("w", encoding="utf-8") as f:
             f.write("\n".join(results.keys()))
-        print(f"\n✓ {len(results)} packages with missing files → {output_file}")
-        print(f"  Total missing: {sum(len(f) for f in results.values())}")
     except OSError as e:
-        print(f"Error writing output: {e}", file=sys.stderr)
+        logger.error("Error writing output: {}", e)
         sys.exit(1)
+
+    total_missing: int = sum(len(files) for files in results.values())
+    logger.info("✓ {} packages with missing files → {}", len(results), output_file)
+    logger.info("  Total missing: {}", total_missing)
 
 
 if __name__ == "__main__":
-    import os
-
     raise SystemExit(main())

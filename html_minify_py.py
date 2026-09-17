@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf_async
+from dh import get_files, mpf
 from lxml import html as lxml_html
 from lxml.html import HtmlElement
 
@@ -122,7 +122,7 @@ def main():
     cwd = Path.cwd()
     args = sys.argv[1:]
     files = [Path(p) for p in args] if args else get_files(cwd, ext=[".html"])
-    mpf_async(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

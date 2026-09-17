@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, gsz, mpf3, rrs, runcmd
+from dh import get_files, gsz, mpf, rrs, runcmd
 
 
 def process_file(path: str | Path) -> None:
@@ -36,7 +36,7 @@ def main() -> None:
     before = gsz(cwd)
     args = sys.argv[1:]
     files = [Path(p) for p in args] if args else get_files(cwd, ext=[".jpg", ".jpeg"])
-    mpf3(process_file, files)
+    mpf(process_file, files)
     after = gsz(cwd)
     rrs(cwd, before, after)
 

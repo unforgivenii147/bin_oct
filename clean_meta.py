@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3
+from dh import cprint, fsz, get_files, gsz, mpf
 
 blank_line = "\n"
 IMAGE_RE = re.compile(r"^\s*(\.\.\s+image::|:target:|:alt:)", re.IGNORECASE)
@@ -75,7 +75,7 @@ def main() -> None:
     if metafiles:
         files.extend(metafiles)
     print(f"{len(files)} files found.")
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
     diff_size = before - gsz(cwd)
     print(f"space saved : {fsz(diff_size)}")
 

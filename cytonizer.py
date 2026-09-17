@@ -6,7 +6,7 @@ import sys
 from os import chdir as os_chdir
 from pathlib import Path
 
-from dh import get_files, mpf3
+from dh import get_files, mpf
 
 START_DIR = Path.cwd()
 NUM_PROCESSES = 4
@@ -32,7 +32,7 @@ def main() -> None:
                 files.extend(get_files(p, ext=[".pyx"]))
     else:
         files = get_files(cwd, ext=[".pyx"])
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
 
 
 if __name__ == "__main__":

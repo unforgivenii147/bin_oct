@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3
+from dh import cprint, fsz, get_files, gsz, mpf
 
 _HASH_TABLE_SIZE = 1 << 14
 _MAX_OFFSET_1 = 2047
@@ -320,7 +320,7 @@ def main() -> None:
                 files.extend(get_files(p))
     else:
         files = get_files(cwd)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

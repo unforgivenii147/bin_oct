@@ -5,7 +5,7 @@ import ast
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_nobinary, gsz, is_binary, mpf3, remove_blank_lines
+from dh import cprint, fsz, get_nobinary, gsz, is_binary, mpf, remove_blank_lines
 
 
 def process_file(path: Path) -> None:
@@ -65,7 +65,7 @@ def main() -> None:
         process_file(files[0])
         sys.exit(0)
     before = gsz(cwd)
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
     diffsize = before - gsz(cwd)
     cprint(f"{fsz(diffsize)}", "cyan")
 

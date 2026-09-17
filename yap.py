@@ -6,7 +6,7 @@ from pathlib import Path
 from time import perf_counter as pff
 from typing import Any
 
-from dh import cprint, format_time, fsz, get_pyfiles, mpf_async
+from dh import cprint, format_time, fsz, get_pyfiles, mpf
 
 MODE: str = "black"
 CHUNK_SIZE: Any = 1024 * 1024
@@ -96,7 +96,7 @@ def main() -> None:
         MODE = "yapf"
     else:
         MODE = "black"
-    mpf_async(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import gzip
 import sys
 from pathlib import Path
 
-from dh import mpf3
+from dh import mpf
 from lzma_mt import compress
 
 
@@ -41,7 +41,7 @@ def main() -> None:
     if not files:
         print("No .gz files found to convert.")
         return
-    results = mpf3(process_file, files)
+    results = mpf(process_file, files)
     success_count = 0
     failure_count = 0
     total_original = 0

@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from dh import cprint, get_files, mpf_async, unique_path
+from dh import cprint, get_files, mpf, unique_path
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.ttFont import TTFont
 
@@ -98,7 +98,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf_async(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

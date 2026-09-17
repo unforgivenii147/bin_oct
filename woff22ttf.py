@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dh import cprint, get_files, mpf3
+from dh import cprint, get_files, mpf
 from fontTools.ttLib import woff2
 
 cwd = Path.cwd()
@@ -25,7 +25,7 @@ def process_file(path: Path) -> bool | None:
 
 def main() -> None:
     files = get_files(cwd, ext=[".woff2"])
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
 
 
 if __name__ == "__main__":

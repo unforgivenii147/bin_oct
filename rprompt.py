@@ -7,7 +7,7 @@ import sys
 import tokenize
 from pathlib import Path
 
-from dh import get_pyfiles, mpf3
+from dh import get_pyfiles, mpf
 
 
 def remove_comments_and_docstrings(source_code: str) -> str:
@@ -88,4 +88,4 @@ if __name__ == "__main__":
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)

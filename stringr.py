@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, is_binary, mpf3, runcmd
+from dh import get_files, is_binary, mpf, runcmd
 
 cwd = Path.cwd()
 outfile = cwd / "all_strings.txt"
@@ -31,7 +31,7 @@ def main() -> None:
     global all_files
     files = [Path(arg) for arg in args] if args else get_files(cwd)
     all_files = len(files)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

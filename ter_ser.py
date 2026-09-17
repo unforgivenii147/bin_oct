@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, gsz, mpf3, rrs, runcmd
+from dh import get_files, gsz, mpf, rrs, runcmd
 
 EXT = [".js", ".jsx", ".jsm", ".jsc"]
 
@@ -54,7 +54,7 @@ def main():
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

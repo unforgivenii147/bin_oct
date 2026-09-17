@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf3
+from dh import get_files, mpf
 
 skl = """SKIP_DIRS: frozenset = frozenset({"lazy", ".git", "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache"})"""
 
@@ -32,7 +32,7 @@ def main():
                 files.extend(get_files(p))
     else:
         files = get_files(cwd)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

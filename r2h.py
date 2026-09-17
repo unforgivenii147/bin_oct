@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf_async
+from dh import get_files, mpf
 from docutils.core import publish_parts
 
 MAX_WORKERS = 4
@@ -44,7 +44,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf_async(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

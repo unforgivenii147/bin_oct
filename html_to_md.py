@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import html2text
-from dh import get_files, mpf3
+from dh import get_files, mpf
 from readability import Document
 
 remove_orig = True
@@ -51,4 +51,4 @@ if __name__ == "__main__":
     if numf == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf3(process_file, files)
+    mpf(process_file, files)

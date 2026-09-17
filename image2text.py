@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import fsz, get_files, gsz, mpf3
+from dh import fsz, get_files, gsz, mpf
 from PIL import Image
 from PIL.Image import Image
 
@@ -130,8 +130,8 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf3(process_file, files)
-    mpf3(process_file2, files)
+    mpf(process_file, files)
+    mpf(process_file2, files)
     diff_size = before - gsz(cwd)
     print(f"space saved : {fsz(diff_size)}")
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dh import fsz, gsz, mpf3, should_skip
+from dh import fsz, gsz, mpf, should_skip
 
 
 def get_filez(root_dir: str | Path):
@@ -48,7 +48,7 @@ def main() -> None:
     for path in get_filez(cwd):
         if path.is_file() and path.suffix in {".c", ".cpp"}:
             files.append(path)
-    mpf3(process_file, files)
+    mpf(process_file, files)
     print(f"{fsz(start_size - gsz(cwd))}")
 
 

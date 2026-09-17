@@ -5,7 +5,7 @@ import mmap
 import re
 from pathlib import Path
 
-from dh import mpf3
+from dh import mpf
 
 LOG_EXT = ".log"
 MMAP_THRESHOLD = 1 * 1024 * 1024
@@ -81,7 +81,7 @@ def main() -> None:
         print(f"No {LOG_EXT} files found.")
         return
     print(f"Found {len(log_files)} log file(s).")
-    results = mpf3(clean_file_worker, log_files)
+    results = mpf(clean_file_worker, log_files)
     success_count = 0
     error_count = 0
     for path, success, message in results:

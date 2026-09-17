@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf3, runcmd
+from dh import get_files, mpf, runcmd
 
 
 def process_file(path: str | Path) -> tuple[bool, Path]:
@@ -46,7 +46,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from dh import get_pyfiles, mpf_async
+from dh import get_pyfiles, mpf
 
 REMOVE_ORIG = False
 LEGACY_MODE = False
@@ -91,7 +91,7 @@ def main():
     if len(files) == 1:
         process_file(files[0])
         return 0
-    mpf_async(process_file, files)
+    mpf(process_file, files)
     return 0
 
 

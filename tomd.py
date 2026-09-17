@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf3
+from dh import get_files, mpf
 from markdownify import markdownify as md
 from readability import Document
 
@@ -45,4 +45,4 @@ if __name__ == "__main__":
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf3(process_file, files)
+    mpf(process_file, files)

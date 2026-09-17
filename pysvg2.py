@@ -5,7 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from dh import get_files, mpf3, rrs, runcmd
+from dh import get_files, mpf, rrs, runcmd
 
 
 def process_file(path) -> None:
@@ -42,4 +42,4 @@ if __name__ == "__main__":
     total_before = 0
     total_after = 0
     total_saved = 0
-    results = mpf3(process_file, files)
+    results = mpf(process_file, files)

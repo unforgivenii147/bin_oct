@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3
+from dh import cprint, fsz, get_files, gsz, mpf
 
 
 def process_file(path) -> None:
@@ -43,7 +43,7 @@ if __name__ == "__main__":
         print("no json files found")
         sys.exit(1)
     print(f"{len(files)} json files found.")
-    mpf3(process_file, files)
+    mpf(process_file, files)
     after = gsz(cwd)
     dsz = abs(before - after)
     if not dsz:

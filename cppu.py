@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3, rrs, runcmd
+from dh import cprint, fsz, get_files, gsz, mpf, rrs, runcmd
 
 EXT = [
     ".java",
@@ -46,7 +46,7 @@ def main() -> None:
     if all_count == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf3(process_file, files)
+    mpf(process_file, files)
     after = gsz(cwd)
     dsz = before - after
     print(f"space change: {fsz(dsz)}")

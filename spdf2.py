@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import fsz, get_files, gsz, mpf_async, runcmd
+from dh import fsz, get_files, gsz, mpf, runcmd
 
 MAX_WORKERS = 4
 
@@ -46,7 +46,7 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf_async(process_file, files)
+    mpf(process_file, files)
     after = gsz(cwd)
     dsz = before - after
     if dsz:

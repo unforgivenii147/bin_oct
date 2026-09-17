@@ -1,11 +1,5 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 
-"""You are a senior Python engineer
-refactor this code:
-- use explicit type annotations and robust validation
-- protect file and network operations
-- use a fixed eight-worker multiprocessing.pool.apply_async design whenever concurrent work is required."""
-
 from __future__ import annotations
 
 import re

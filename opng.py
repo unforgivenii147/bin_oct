@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, get_files, gsz, mpf3, runcmd
+from dh import cprint, get_files, gsz, mpf, runcmd
 
 START_DIR = Path.cwd()
 NUM_PROCESSES = 4
@@ -50,7 +50,7 @@ def main() -> None:
                 files.extend(get_files(p, ext=[".png", ".PNG"]))
     else:
         files = get_files(cwd, ext=[".png", ".PNG"])
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
 
 
 if __name__ == "__main__":

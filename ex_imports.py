@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import tree_sitter_python as tsp
-from dh import get_files, mpf3, unique_path
+from dh import get_files, mpf, unique_path
 from tree_sitter import Language, Parser
 
 OUTPUT_DIR = Path.home() / "tmp" / "output"
@@ -32,7 +32,7 @@ def main() -> None:
         outfile = unique_path(outfile)
     all_imports = []
     files = get_files(cwd, ext=[".py"])
-    results = mpf3(process_file, files)
+    results = mpf(process_file, files)
     for imports in results:
         if imports:
             for k in imports:

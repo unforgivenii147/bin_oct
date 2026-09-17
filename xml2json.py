@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import xmltodict
-from dh import cprint, get_files, mpf3
+from dh import cprint, get_files, mpf
 
 MAX_QUEUE = 16
 REMOVE_ORIG = True
@@ -31,7 +31,7 @@ def main() -> None:
     cwd = Path.cwd()
     args = sys.argv[1:]
     files = [Path(p) for p in args] if args else get_files(cwd, ext=[".xml", ".svg"])
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

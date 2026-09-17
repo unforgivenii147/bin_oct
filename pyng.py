@@ -1,171 +1,202 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
+"""
+Pure-Python ping for Termux.
+- Uses raw ICMP socket when possible (needs root / CAP_NET_RAW).
+- Falls back to TCP-connect ping (no root required).
+"""
 
 import argparse
-import re
-import subprocess
+import os
+import random
+import select
+import socket
+import struct
 import sys
+import time
 
 
-class PingResult:
-    def __init__(self):
-        self.host = ""
-        self.ip = ""
-        self.packets_sent = 0
-        self.packets_received = 0
-        self.packets_lost = 0
-        self.min_time = None
-        self.avg_time = None
-        self.max_time = None
-        self.stddev_time = None
-        self.packet_loss_percent = 0.0
-        self.responses = []
-
-    def __str__(self) -> str:
-        result = f"\n--- {self.host} ping statistics ---\n"
-        result += f"{self.packets_sent} packets transmitted, {self.packets_received} packets received, "
-        result += f"{self.packet_loss_percent:.1f}% packet loss\n"
-        if self.packets_received > 0:
-            result += f"round-trip min/avg/max/stddev = "
-            result += f"{self.min_time:.3f}/{self.avg_time:.3f}/{self.max_time:.3f}"
-            if self.stddev_time:
-                result += f"/{self.stddev_time:.3f}"
-            result += " ms\n"
-        return result
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
 
 
-def parse_ping_response(output: str) -> PingResult:
-    result = PingResult()
-    lines = output.split("\n")
-    if lines:
-        first_line = lines[0]
-        match = re.match(r"PING\s+(\S+)\s+\(([^)]+)\)", first_line)
-        if match:
-            result.host = match.group(1)
-            result.ip = match.group(2)
-    for line in lines:
-        match = re.search(r"bytes from.*icmp_seq=(\d+).*time=([0-9.]+)\s*ms", line)
-        if match:
-            result.responses.append(
-                {"seq": int(match.group(1)), "time": float(match.group(2))}
-            )
-    stats_match = re.search(
-        r"(\d+)\s+packets transmitted,\s+(\d+)(?:\s+packets)?\s+received,\s+([0-9.]+)%\s+packet loss",
-        output,
-    )
-    if stats_match:
-        result.packets_sent = int(stats_match.group(1))
-        result.packets_received = int(stats_match.group(2))
-        result.packets_lost = result.packets_sent - result.packets_received
-        result.packet_loss_percent = float(stats_match.group(3))
-    time_match = re.search(
-        r"min/avg/max(?:/stddev)?\s*=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)(?:/([0-9.]+))?",
-        output,
-    )
-    if time_match:
-        result.min_time = float(time_match.group(1))
-        result.avg_time = float(time_match.group(2))
-        result.max_time = float(time_match.group(3))
-        if time_match.group(4):
-            result.stddev_time = float(time_match.group(4))
-    return result
+# ---------------------------------------------------------------------------
+# Checksum
+# ---------------------------------------------------------------------------
+def checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
 
 
-def ping(
-    host: str,
-    count: int = 4,
-    timeout: int = 4,
-    packet_size: int = 56,
-    verbose: bool = True,
-) -> PingResult | None:
+# ---------------------------------------------------------------------------
+# Raw ICMP ping (root only)
+# ---------------------------------------------------------------------------
+def icmp_ping(host: str, timeout: float, seq: int, payload_size: int = 32):
     try:
-        cmd = [
-            "ping",
-            "-c",
-            str(count),
-            "-W",
-            str(timeout * 400),
-            "-s",
-            str(packet_size),
-            host,
-        ]
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-        )
-        output = ""
-        if verbose:
-            for line in process.stdout:
-                print(line.rstrip())
-                output += line
+        dest = socket.gethostbyname(host)
+    except socket.gaierror as e:
+        return None, str(e)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except PermissionError:
+        return None, "permission"
+    except OSError as e:
+        return None, str(e)
+
+    sock.settimeout(timeout)
+
+    ident = os.getpid() & 0xFFFF
+    payload = b"P" * payload_size
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, 0, ident, seq)
+    chksum = checksum(header + payload)
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, chksum, ident, seq)
+    packet = header + payload
+
+    send_time = time.time()
+    try:
+        sock.sendto(packet, (dest, 0))
+    except OSError as e:
+        sock.close()
+        return None, str(e)
+
+    deadline = send_time + timeout
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None, "timeout"
+            r, _, _ = select.select([sock], [], [], remaining)
+            if not r:
+                return None, "timeout"
+            recv_time = time.time()
+            data, addr = sock.recvfrom(1024)
+            # IPv4 header length
+            ihl = (data[0] & 0x0F) * 4
+            icmp_type, code, _, recv_id, recv_seq = struct.unpack(
+                "!BBHHH", data[ihl : ihl + 8]
+            )
+            if icmp_type == ICMP_ECHO_REPLY and recv_id == ident and recv_seq == seq:
+                rtt = (recv_time - send_time) * 1000.0
+                return (addr[0], rtt), None
+    finally:
+        sock.close()
+
+
+# ---------------------------------------------------------------------------
+# TCP ping (no root required)
+# ---------------------------------------------------------------------------
+def tcp_ping(host: str, timeout: float, port: int = 443):
+    try:
+        dest = socket.gethostbyname(host)
+    except socket.gaierror as e:
+        return None, str(e)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    start = time.time()
+    try:
+        sock.connect((dest, port))
+    except (socket.timeout, TimeoutError):
+        return None, "timeout"
+    except ConnectionRefusedError:
+        # Host responded with RST → reachable, still useful
+        return (dest, (time.time() - start) * 1000.0), None
+    except OSError as e:
+        return None, str(e)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return (dest, (time.time() - start) * 1000.0), None
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def resolve(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror:
+        return host
+
+
+def run(host, count, timeout, interval, mode, tcp_port):
+    print(f"PING {host} ({resolve(host)})  mode={mode}  timeout={timeout}s")
+    print()
+
+    sent = recv = 0
+    rtts = []
+    use_icmp = (mode == "icmp") or (mode == "auto")
+    warned_fallback = False
+
+    for seq in range(1, count + 1):
+        sent += 1
+        result = None
+        err = None
+
+        if use_icmp:
+            result, err = icmp_ping(host, timeout, seq)
+            if err == "permission":
+                if mode == "icmp":
+                    print("Raw ICMP not permitted. Run as root, or use --mode tcp.")
+                    return
+                if not warned_fallback:
+                    print("[i] Raw ICMP not permitted, falling back to TCP ping.\n")
+                    warned_fallback = True
+                use_icmp = False
+
+        if not use_icmp:
+            result, err = tcp_ping(host, timeout, tcp_port)
+
+        if result:
+            ip, rtt = result
+            rtts.append(rtt)
+            recv += 1
+            print(f"64 bytes from {ip}: seq={seq} time={rtt:.1f} ms")
         else:
-            output, _ = process.communicate()
-        process.wait()
-        result = parse_ping_response(output)
-        return result
-    except FileNotFoundError:
+            print(f"Request timeout for icmp_seq {seq} ({err})")
+
+        if seq < count:
+            time.sleep(interval)
+
+    print()
+    print(f"--- {host} ping statistics ---")
+    loss = (sent - recv) / sent * 100 if sent else 0
+    print(f"{sent} packets transmitted, {recv} received, {loss:.0f}% packet loss")
+    if rtts:
         print(
-            "Error: 'ping' command not found. Make sure you're on a Unix-like system."
+            f"rtt min/avg/max = {min(rtts):.1f}/"
+            f"{sum(rtts) / len(rtts):.1f}/{max(rtts):.1f} ms"
         )
-        return None
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Ping a host using ICMP echo requests",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 ping.py google.com
-  python3 ping.py -c 10 8.8.8.8
-  python3 ping.py -c 5 -t 2 example.com
-  python3 ping.py -s 128 github.com
-        """,
+    p = argparse.ArgumentParser(description="Pure-Python ping for Termux")
+    p.add_argument("host", help="hostname or IP address")
+    p.add_argument("-c", "--count", type=int, default=4, help="number of pings")
+    p.add_argument("-W", "--timeout", type=float, default=2.0, help="timeout seconds")
+    p.add_argument("-i", "--interval", type=float, default=1.0, help="interval seconds")
+    p.add_argument(
+        "-m",
+        "--mode",
+        choices=["auto", "icmp", "tcp"],
+        default="auto",
+        help="auto (default) tries ICMP then TCP; icmp = root only; tcp = no root",
     )
-    parser.add_argument("host", help="Hostname or IP address to ping")
-    parser.add_argument(
-        "-c",
-        "--count",
-        type=int,
-        default=4,
-        help="Number of ping requests (default: 4)",
-    )
-    parser.add_argument(
-        "-t",
-        "--timeout",
-        type=int,
-        default=4,
-        help="Timeout per request in seconds (default: 4)",
-    )
-    parser.add_argument(
-        "-s",
-        "--size",
-        type=int,
-        default=56,
-        help="ICMP payload size in bytes (default: 56)",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Quiet mode - no output until statistics",
-    )
-    args = parser.parse_args()
-    result = ping(
-        args.host,
-        count=args.count,
-        timeout=args.timeout,
-        packet_size=args.size,
-        verbose=not args.quiet,
-    )
-    if result:
-        print(result)
-        sys.exit(0 if result.packet_loss_percent < 100 else 1)
-    else:
-        sys.exit(1)
+    p.add_argument("-p", "--port", type=int, default=443, help="TCP port (default 443)")
+    args = p.parse_args()
+
+    try:
+        run(args.host, args.count, args.timeout, args.interval, args.mode, args.port)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

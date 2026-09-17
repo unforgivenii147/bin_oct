@@ -4,10 +4,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gext, gsz, mpf_async
+from dh import cprint, fsz, get_files, gext, gsz, mpf
 from rcssmin import cssmin
 
-mpf = mpf_async
+mpf = mpf
 
 
 def process_file(path: Path) -> str:

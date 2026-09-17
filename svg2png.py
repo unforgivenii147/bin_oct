@@ -5,7 +5,7 @@ from io import BytesIO
 from pathlib import Path
 
 import cairosvg
-from dh import get_files, mpf3
+from dh import get_files, mpf
 from PIL import Image
 
 
@@ -27,7 +27,7 @@ def process_file(path) -> None:
 def main() -> None:
     cwd = Path.cwd()
     files = get_files(cwd, ext=[".svg"])
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

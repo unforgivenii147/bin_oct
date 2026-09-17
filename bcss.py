@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import cprint, fsz, get_files, gsz, mpf3, runcmd
+from dh import cprint, fsz, get_files, gsz, mpf, runcmd
 
 
 def process_file(path) -> bool | None:
@@ -36,7 +36,7 @@ def main() -> None:
     files = (
         [Path(p) for p in args] if args else get_files(cwd, ext=[".css", ".min.css"])
     )
-    _ = mpf3(process_file, files)
+    _ = mpf(process_file, files)
     diff_size = before - gsz(cwd)
     cprint(f"space freed : {fsz(diff_size)}", "green")
 

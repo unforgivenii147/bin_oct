@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import mpf3, runcmd
+from dh import mpf, runcmd
 
 
 def process_file(path):
@@ -42,7 +42,7 @@ def main() -> None:
             ],
         )
     )
-    mpf3(process_file, files)
+    mpf(process_file, files)
 
 
 if __name__ == "__main__":

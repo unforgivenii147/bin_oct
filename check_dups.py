@@ -9,7 +9,7 @@ from ast import AsyncFunctionDef, ClassDef, FunctionDef
 from dataclasses import dataclass
 from pathlib import Path
 
-from dh import get_pyfiles, gsz, mpf3
+from dh import get_pyfiles, gsz, mpf
 
 
 @dataclass
@@ -194,7 +194,7 @@ def main() -> None:
                 files.extend(get_pyfiles(p))
     else:
         files = get_pyfiles(cwd)
-    results = mpf3(process_file, files)
+    results = mpf(process_file, files)
     for result in results:
         if result:
             pass
