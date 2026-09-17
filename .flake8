@@ -1,0 +1,18 @@
+[flake8]
+max-line-length = 120
+select = D, E, F, W
+ignore = D100, D101, D102, D103, D104, D105, D106, D107, D200, D202, D203, D204, D205, D212, D301, D400, D401, D402, D403, D404, D413, D415, D416, D417, E121, E123, E126, E127, E131, E203, E226, E24, E266, E305, E306, E501, E704, E711, E721, E731, E741, F403, F841, W503, W504,E722,E601
+exclude =
+    .git
+    build
+    .tox
+    .eggs
+    __pycache__
+    dist
+per-file-ignores =
+    tests/*: S101
+    __init__.py: F401
+    doc/conf.py: E402
+force-check = True
+max-complexity = 10
+docstring-convention = google

@@ -1,0 +1,18 @@
+[MAIN]
+jobs=4
+[MESSAGES CONTROL]
+disable=
+    E1101,
+    C0114,  # missing-module-docstring
+    C0115,  # missing-class-docstring
+    C0116,  # missing-function-docstring
+    C0111   # missing-docstring (legacy)
+[REPORTS]
+# Enable only the score report
+reports=yes
+evaluation=10.0 - ((float(5 * error + warning + refactor + convention) / statement) * 10)
+# Show only the final score, not full reports
+output-format=text
+[SCORING]
+# Score calculation (lower is better)
+score=yes
