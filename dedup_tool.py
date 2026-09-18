@@ -47,7 +47,9 @@ from typing import Iterable, Iterator, Sequence
 # ---------------------------------------------------------------------------
 
 
-def iter_py_files(root: Path, *, exclude_names: set[str] | None = None) -> Iterator[Path]:
+def iter_py_files(
+    root: Path, *, exclude_names: set[str] | None = None
+) -> Iterator[Path]:
     """Yield every ``.py`` file under *root* recursively.
 
     Parameters
@@ -139,7 +141,9 @@ def assign_names(node: ast.Assign) -> list[str]:
     return [t.id for t in node.targets if isinstance(t, ast.Name)]
 
 
-def collect_ast_declarations(tree: ast.Module, lines: Sequence[str]) -> list[Declaration]:
+def collect_ast_declarations(
+    tree: ast.Module, lines: Sequence[str]
+) -> list[Declaration]:
     """Extract top-level assignments / functions / classes from *tree*."""
     out: list[Declaration] = []
     for node in tree.body:
@@ -147,7 +151,9 @@ def collect_ast_declarations(tree: ast.Module, lines: Sequence[str]) -> list[Dec
             src = slice_lines(lines, node.lineno, node.end_lineno)
             h = ast_hash(node)
             for name in assign_names(node):
-                out.append(Declaration("assign", name, node.lineno, node.end_lineno, src, h))
+                out.append(
+                    Declaration("assign", name, node.lineno, node.end_lineno, src, h)
+                )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.append(
                 Declaration(
@@ -244,8 +250,8 @@ def _ast_process_file(job: tuple[str, str]) -> tuple[str, int, str | None]:
 
     decls = collect_ast_declarations(tree, lines)
 
-    seen_keys: set[tuple[str, str]] = set()          # (kind, name)
-    seen_hashes: set[tuple[str, str]] = set()        # (kind, content_hash)
+    seen_keys: set[tuple[str, str]] = set()  # (kind, name)
+    seen_hashes: set[tuple[str, str]] = set()  # (kind, content_hash)
     dup_ranges: list[tuple[int, int]] = []
     dup_records: list[tuple[Declaration, str]] = []
     ranges_seen: set[tuple[int, int]] = set()
@@ -441,21 +447,26 @@ def cmd_ts(args: argparse.Namespace) -> int:
     try:
         parser = _ts_make_parser()
     except ImportError as e:
-        print(f"`ts` subcommand requires tree_sitter + tree_sitter_python: {e}",
-              file=sys.stderr)
+        print(
+            f"`ts` subcommand requires tree_sitter + tree_sitter_python: {e}",
+            file=sys.stderr,
+        )
         return 2
 
     roots = args.paths or [Path.cwd()]
-    output_path = (Path.cwd() / args.output).resolve() if not Path(args.output).is_absolute() \
+    output_path = (
+        (Path.cwd() / args.output).resolve()
+        if not Path(args.output).is_absolute()
         else Path(args.output)
+    )
 
     exclude_names: set[str] = set(args.exclude or [])
     exclude_names.add(output_path.name)
     if args.exclude_self:
         exclude_names.add(Path(sys.argv[0]).name)
 
-    seen: dict[str, Declaration] = {}    # hash -> first occurrence
-    dups: dict[str, Declaration] = {}    # hash -> representative (first occurrence)
+    seen: dict[str, Declaration] = {}  # hash -> first occurrence
+    dups: dict[str, Declaration] = {}  # hash -> representative (first occurrence)
 
     for root in roots:
         for file in iter_py_files(root, exclude_names=exclude_names):
@@ -566,12 +577,17 @@ def build_parser() -> argparse.ArgumentParser:
         "ast",
         help="AST-based dedup across one or more paths (default: cwd).",
     )
-    p_ast.add_argument("paths", nargs="*", type=Path,
-                       help="Files or directories. Empty = walk cwd.")
-    p_ast.add_argument("--suffix", default="_dups.py",
-                       help="Suffix for per-file archive (default: _dups.py).")
-    p_ast.add_argument("--workers", type=int, default=0,
-                       help="Parallel workers (0 = auto).")
+    p_ast.add_argument(
+        "paths", nargs="*", type=Path, help="Files or directories. Empty = walk cwd."
+    )
+    p_ast.add_argument(
+        "--suffix",
+        default="_dups.py",
+        help="Suffix for per-file archive (default: _dups.py).",
+    )
+    p_ast.add_argument(
+        "--workers", type=int, default=0, help="Parallel workers (0 = auto)."
+    )
     p_ast.set_defaults(func=cmd_ast)
 
     # ts -------------------------------------------------------------------
@@ -579,16 +595,26 @@ def build_parser() -> argparse.ArgumentParser:
         "ts",
         help="Tree-sitter content dedup (diduper/tsdeduper).",
     )
-    p_ts.add_argument("paths", nargs="*", type=Path,
-                      help="Roots to scan (default: cwd).")
-    p_ts.add_argument("--output", default="utils.py",
-                      help="File to write representative duplicates to "
-                           "(default: utils.py).")
-    p_ts.add_argument("--exclude", action="append", default=[],
-                      metavar="NAME",
-                      help="Basename to skip (repeatable).")
-    p_ts.add_argument("--exclude-self", action="store_true",
-                      help="Skip the running script's own file (diduper default).")
+    p_ts.add_argument(
+        "paths", nargs="*", type=Path, help="Roots to scan (default: cwd)."
+    )
+    p_ts.add_argument(
+        "--output",
+        default="utils.py",
+        help="File to write representative duplicates to (default: utils.py).",
+    )
+    p_ts.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Basename to skip (repeatable).",
+    )
+    p_ts.add_argument(
+        "--exclude-self",
+        action="store_true",
+        help="Skip the running script's own file (diduper default).",
+    )
     p_ts.set_defaults(func=cmd_ts)
 
     # refactor -------------------------------------------------------------
@@ -596,10 +622,18 @@ def build_parser() -> argparse.ArgumentParser:
         "refactor",
         help="Extract top-level defs/classes/consts into a package.",
     )
-    p_ref.add_argument("--input-dir", type=Path, default=Path("."),
-                       help="Directory to scan (default: .).")
-    p_ref.add_argument("--output-dir", type=Path, default=Path("output"),
-                       help="Output package directory (default: output).")
+    p_ref.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("."),
+        help="Directory to scan (default: .).",
+    )
+    p_ref.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("output"),
+        help="Output package directory (default: output).",
+    )
     p_ref.set_defaults(func=cmd_refactor)
 
     return parser

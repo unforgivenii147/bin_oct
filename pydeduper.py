@@ -1,36 +1,4 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-"""
-pydedup.py — Find duplicate top-level Python definitions and consolidate them.
-
-Subcommands
------------
-    report   Show duplicates without modifying anything.
-    copy     Copy one representative of each duplicate group into utils/.
-    move     Copy into utils/ and patch the originals with imports.
-
-Behavioral mapping to the original scripts
-------------------------------------------
-    ddup.py      ->  pydedup.py copy --func-file func.py --class-file class.py --const-file const.py
-                     pydedup.py move --func-file func.py --class-file class.py --const-file const.py
-
-    ddupr.py     ->  pydedup.py report
-                     pydedup.py copy
-                     pydedup.py move
-
-    dduputil.py  ->  pydedup.py copy --min-occurs 2 --workers N
-                     pydedup.py move --min-occurs 2 --workers N
-
-    vddup.py     ->  pydedup.py copy --func-file functions.py \
-                                    --class-file classes.py \
-                                    --const-file constants.py
-
-    vddup2.py    ->  pydedup.py copy --match-mode name --no-archives --const-mode all
-
-Third-party dependencies (all optional; the script degrades gracefully):
-    loguru            pretty logging (falls back to stdlib logging)
-    zstandard         .zst decompression
-    brotli / brotlicffi  .br decompression
-"""
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
@@ -56,15 +24,18 @@ from typing import Iterable, Iterator, Optional
 # ---------------------------------------------------------------------------
 try:
     from loguru import logger
+
     _HAS_LOGURU = True
 except ImportError:  # pragma: no cover
     import logging
+
     logger = logging.getLogger("pydedup")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     _HAS_LOGURU = False
 
 try:
     import zstandard as zstd  # type: ignore
+
     _HAS_ZSTD = True
 except ImportError:
     zstd = None  # type: ignore
@@ -72,10 +43,12 @@ except ImportError:
 
 try:
     import brotli  # type: ignore
+
     _HAS_BROTLI = True
 except ImportError:
     try:
         import brotlicffi as brotli  # type: ignore
+
         _HAS_BROTLI = True
     except ImportError:
         brotli = None  # type: ignore
@@ -86,9 +59,15 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 ARCHIVE_SUFFIXES = (
-    ".zip", ".whl",
-    ".tar", ".tar.gz", ".tar.bz2", ".tar.xz",
-    ".tgz", ".tbz2", ".txz",
+    ".zip",
+    ".whl",
+    ".tar",
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tgz",
+    ".tbz2",
+    ".txz",
 )
 COMPRESSED_SUFFIXES = (".gz", ".bz2", ".xz", ".lzma", ".zst", ".br")
 PYTHON_SUFFIX = ".py"
@@ -110,23 +89,25 @@ SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_module
 @dataclass
 class Source:
     """A unit of Python source text (from a file, an archive member, or a decompressed stream)."""
-    origin: str                    # human-readable identifier (path or archive::member)
-    text: str                      # decoded source
-    path: Optional[Path] = None    # on-disk path if patchable, else None
+
+    origin: str  # human-readable identifier (path or archive::member)
+    text: str  # decoded source
+    path: Optional[Path] = None  # on-disk path if patchable, else None
 
 
 @dataclass
 class Definition:
     """A single top-level function, class or constant."""
-    kind: str                      # 'func' | 'class' | 'const'
+
+    kind: str  # 'func' | 'class' | 'const'
     name: str
-    source: str                    # normalized source (ast.unparse output)
+    source: str  # normalized source (ast.unparse output)
     content_hash: str
     origin: str
     lineno: int
     end_lineno: int
     imports: list[str] = field(default_factory=list)
-    path: Optional[Path] = None    # None for archive/compressed members
+    path: Optional[Path] = None  # None for archive/compressed members
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +132,13 @@ def _setup_logging(level: str, verbose: bool) -> None:
             format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
             colorize=True,
         )
-        logger.add("pydedup.log", level="DEBUG", rotation="5 MB", retention=3, encoding="utf-8")
+        logger.add(
+            "/data/data/com.termux/files/home/tmp/apps/pydedup.log",
+            level="DEBUG",
+            rotation="5 MB",
+            retention=3,
+            encoding="utf-8",
+        )
     else:
         valid = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
         logging.getLogger().setLevel(lvl if lvl in valid else "INFO")
@@ -231,7 +218,9 @@ def _iter_tar(path: Path) -> Iterator[Source]:
     try:
         with tarfile.open(path, "r:*") as tf:
             for member in tf.getmembers():
-                if not member.isfile() or not member.name.lower().endswith(PYTHON_SUFFIX):
+                if not member.isfile() or not member.name.lower().endswith(
+                    PYTHON_SUFFIX
+                ):
                     continue
                 fh = tf.extractfile(member)
                 if fh is None:
@@ -550,7 +539,9 @@ def write_utils(
         seen_names: set[str] = set()
         for r in new_reps:
             if r.name in seen_names:
-                logger.warning(f"name collision in {target.name}: '{r.name}' — skipping")
+                logger.warning(
+                    f"name collision in {target.name}: '{r.name}' — skipping"
+                )
                 continue
             seen_names.add(r.name)
             deduped.append(r)
@@ -669,7 +660,9 @@ def _patch_file(
         return
 
     if dry_run:
-        logger.info(f"[dry-run] would patch {path}: -{len(defs)} definition(s), +imports")
+        logger.info(
+            f"[dry-run] would patch {path}: -{len(defs)} definition(s), +imports"
+        )
     else:
         path.write_text(new_text, encoding="utf-8")
         _success(f"patched {path}: -{len(defs)} definition(s)")
@@ -710,41 +703,288 @@ def patch_originals(
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     """Add the flags shared by every subcommand."""
     p.add_argument(
-        "--dir", type=Path, default=Path("."),
+        "--dir",
+        type=Path,
+        default=Path("."),
         help="root directory to scan (default: current directory)",
     )
     p.add_argument(
-        "--workers", type=int, default=max(1, cpu_count() - 1),
+        "--workers",
+        type=int,
+        default=max(1, cpu_count() - 1),
         help="number of worker processes (default: cpu_count-1)",
     )
     p.add_argument(
-        "--min-occurs", type=int, default=2,
+        "--min-occurs",
+        type=int,
+        default=2,
         help="minimum occurrences to count as duplicate (default: 2)",
     )
     p.add_argument(
-        "--match-mode", choices=("content", "name"), default="content",
+        "--match-mode",
+        choices=("content", "name"),
+        default="content",
         help="how to decide duplicates (default: content)",
     )
     p.add_argument(
-        "--const-mode", choices=("all", "uppercase", "literal"), default="all",
+        "--const-mode",
+        choices=("all", "uppercase", "literal"),
+        default="all",
         help="which top-level Assign nodes count as constants (default: all)",
     )
     p.add_argument(
-        "--no-archives", action="store_true",
+        "--no-archives",
+        action="store_true",
         help="do not scan zip/tar archives or compressed files",
     )
     p.add_argument(
-        "--utils-dir", type=Path, default=None,
+        "--utils-dir",
+        type=Path,
+        default=None,
         help="output directory (default: <root>/utils)",
     )
     p.add_argument(
-        "--func-file", default="funcs.py",
+        "--func-file",
+        default="funcs.py",
         help="file name for functions inside utils/ (default: funcs.py)",
     )
     p.add_argument(
-        "--class-file", default="classes.py",
+        "--class-file",
+        default="classes.py",
         help="file name for classes inside utils/ (default: classes.py)",
     )
     p.add_argument(
-        "--const-file", default="const.py",
+        "--const-file",
+        default="const.py",
         help="file name for constants inside utils/ (default: const.py)",
+    )
+    p.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        default="INFO",
+        help="logging level (default: INFO)",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="shortcut for --log-level DEBUG",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would happen without writing anything",
+    )
+
+
+def _resolve_utils_dir(args: argparse.Namespace) -> Path:
+    """Return the utils/ directory for *args*, honouring --utils-dir if set."""
+    if args.utils_dir is not None:
+        return args.utils_dir.resolve()
+    return (args.dir / "utils").resolve()
+
+
+def _load_sources(args: argparse.Namespace) -> list[Source]:
+    """Resolve --dir, verify it exists, and scan it into a list of Sources."""
+    root = args.dir.resolve()
+    if not root.exists():
+        logger.error(f"directory does not exist: {root}")
+        return []
+    if not root.is_dir():
+        logger.error(f"not a directory: {root}")
+        return []
+    include_archives = not args.no_archives
+    sources = list(iter_sources(root, include_archives=include_archives))
+    logger.info(f"scanned {root}: {len(sources)} source unit(s)")
+    return sources
+
+
+def _extract_and_group(
+    args: argparse.Namespace,
+) -> tuple[list[Definition], dict[str, list[Definition]]]:
+    """Shared pipeline for all subcommands: load sources, extract, group."""
+    sources = _load_sources(args)
+    if not sources:
+        return [], {}
+    defs = _collect_all(sources, args.workers, args.const_mode)
+    logger.info(f"extracted {len(defs)} top-level definition(s)")
+    groups = group_duplicates(defs, args.min_occurs, args.match_mode)
+    logger.info(
+        f"found {len(groups)} duplicate group(s) "
+        f"(min-occurs={args.min_occurs}, match-mode={args.match_mode})"
+    )
+    return defs, groups
+
+
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
+def cmd_report(args: argparse.Namespace) -> int:
+    """Print duplicate groups to stdout without touching the filesystem."""
+    _, groups = _extract_and_group(args)
+    if not groups:
+        _success("no duplicates found")
+        return 0
+
+    total = sum(len(g) for g in groups.values())
+    _success(f"{len(groups)} duplicate group(s) covering {total} definition(s)")
+
+    for key, group in sorted(
+        groups.items(), key=lambda kv: (-len(kv[1]), kv[1][0].kind, kv[1][0].name)
+    ):
+        rep = group[0]
+        header = f"{rep.kind} '{rep.name}' — {len(group)} occurrence(s)"
+        print()
+        print("=" * len(header))
+        print(header)
+        print("=" * len(header))
+        for d in group:
+            loc = f"{d.origin}:{d.lineno}-{d.end_lineno}"
+            print(f"  [{d.content_hash[:12]}] {loc}")
+        if len({d.content_hash for d in group}) > 1:
+            print(f"  note: grouped by {args.match_mode}, contents differ")
+    return 0
+
+
+def cmd_copy(args: argparse.Namespace) -> int:
+    """Write one representative per duplicate group into utils/."""
+    _, groups = _extract_and_group(args)
+    if not groups:
+        _success("no duplicates to copy")
+        return 0
+
+    utils_dir = _resolve_utils_dir(args)
+    written = write_utils(
+        groups,
+        utils_dir,
+        args.func_file,
+        args.class_file,
+        args.const_file,
+        dry_run=args.dry_run,
+    )
+    if not written:
+        logger.info("nothing new to write")
+        return 0
+    verb = "would write" if args.dry_run else "wrote"
+    _success(f"{verb} {len(written)} file(s) into {utils_dir}")
+    return 0
+
+
+def cmd_move(args: argparse.Namespace) -> int:
+    """Copy representatives into utils/ and remove/patch the originals."""
+    _, groups = _extract_and_group(args)
+    if not groups:
+        _success("no duplicates to move")
+        return 0
+
+    utils_dir = _resolve_utils_dir(args)
+    written = write_utils(
+        groups,
+        utils_dir,
+        args.func_file,
+        args.class_file,
+        args.const_file,
+        dry_run=args.dry_run,
+    )
+
+    # Only patch originals for kinds whose representative was actually
+    # written into utils/. Otherwise the injected import would point at
+    # a module that doesn't contain the symbol.
+    patchable: dict[str, list[Definition]] = {
+        key: group for key, group in groups.items() if group[0].kind in written
+    }
+
+    if not patchable:
+        logger.warning("nothing was written; skipping originals patching")
+        return 0
+
+    patch_originals(
+        patchable,
+        utils_dir,
+        args.dir.resolve(),
+        args.func_file,
+        args.class_file,
+        args.const_file,
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Parser / entry point
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser with all subcommands."""
+    parser = argparse.ArgumentParser(
+        prog="pydedup",
+        description=(
+            "Find duplicate top-level Python definitions (functions, classes, "
+            "constants) across a tree and consolidate them into utils/."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    p_report = subparsers.add_parser(
+        "report",
+        help="show duplicate groups without modifying anything",
+        description="Scan and print duplicate definitions. No files are written.",
+    )
+    _add_common_args(p_report)
+    p_report.set_defaults(func=cmd_report)
+
+    p_copy = subparsers.add_parser(
+        "copy",
+        help="copy one representative of each duplicate group into utils/",
+        description=(
+            "Scan, group duplicates, and append one representative per group "
+            "into utils/funcs.py, utils/classes.py and/or utils/const.py. "
+            "Originals are left untouched."
+        ),
+    )
+    _add_common_args(p_copy)
+    p_copy.set_defaults(func=cmd_copy)
+
+    p_move = subparsers.add_parser(
+        "move",
+        help="copy into utils/ and patch the originals with imports",
+        description=(
+            "Like `copy`, but also removes the moved definitions from each "
+            "origin file and inserts `from utils.<mod> import <name>` at the "
+            "top. Files that fail to re-parse are left untouched."
+        ),
+    )
+    _add_common_args(p_move)
+    p_move.set_defaults(func=cmd_move)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entry point. Returns a process exit status."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    _setup_logging(args.log_level, args.verbose)
+
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 2
+
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        logger.warning("interrupted by user")
+        return 130
+    except BrokenPipeError:
+        # stdout was closed (e.g. piped into `head`); exit quietly.
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        if _HAS_LOGURU:
+            logger.exception(f"fatal: {exc}")
+        else:
+            logger.exception(f"fatal: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

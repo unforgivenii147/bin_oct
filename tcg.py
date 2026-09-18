@@ -86,7 +86,7 @@ def create_symlink(script_path: Path) -> None:
 
 
 def main() -> None:
-    archive = True  # "-a" in sys.argv
+    archive = "-a" in sys.argv
     args = [arg for arg in sys.argv[1:] if arg != "-a"]
     if len(args) != 1:
         print(f"Usage: {sys.argv[0]} [-a] <filename>", file=sys.stderr)

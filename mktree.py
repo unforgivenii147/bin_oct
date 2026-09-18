@@ -2,402 +2,552 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 import sys
 from pathlib import Path
-from typing import Any
 
-try:
-    import cv2
-    import pytesseract
-    from PIL import Image
+NODE_MARKERS = ("\u251c\u2500\u2500", "\u2514\u2500\u2500", "|--", "`--")
+FOOTER_RE = re.compile(
+    r"^\d+\s+(directories|files|dirs|items)(,\s*\d+\s+(directories|files|dirs|items))?$"
+)
+JUNK_LINE_CHARS = set(" \u2502\u251c\u2514\u2500|+-`")
+JUNK_TOKEN_RE = re.compile(r"^[\u2502\u251c\u2514\u2500|+\-]+$")
+LEAD_JUNK_RE = re.compile(
+    r"^([\u2502\u251c\u2514\u2500|+`\-]{2,}|[\u2502\u251c\u2514\u2500|+`\-]+\s+)"
+)
 
-    HAS_OCR = True
-except ImportError:
-    HAS_OCR = False
+
+def strip_leading_junk(left, text):
+    m = LEAD_JUNK_RE.match(text)
+    if not m:
+        return left, text
+    return left + len(m.group(0)), text[m.end() :]
 
 
-class TreeParser:
-    TREE_SYMBOLS = ["├", "└", "│", "┌", "─", "┐"]
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
-    def __init__(self, base_path: Path = Path.cwd()):
-        self.base_path = base_path
-        self.entries: list[dict[str, Any]] = []
 
-    def parse(self, text: str) -> list[dict[str, Any]]:
-        lines = [line.rstrip() for line in text.split("\n") if line.strip()]
-        if not lines:
-            return []
-        format_type = self._detect_format(lines)
-        if format_type == "tree":
-            self._parse_tree_format(lines)
-        elif format_type == "indented":
-            self._parse_indented_format(lines)
+def find_node_marker(line):
+    best, best_len = None, 0
+    for m in NODE_MARKERS:
+        i = line.find(m)
+        if i != -1 and (best is None or i < best):
+            best, best_len = i, len(m)
+    return best, best_len
+
+
+def clean_name(raw, keep_suffix=False):
+    raw = raw.strip()
+    raw = re.sub(r"\s+#.*$", "", raw).strip()
+    if not raw or raw.startswith("#"):
+        return None, False
+    explicit = raw.endswith("/")
+    raw = raw.rstrip("/")
+    if not keep_suffix:
+        raw = raw.rstrip("*@=|")
+    raw = raw.strip()
+    if not raw:
+        return None, explicit
+    if raw == ".\\":
+        raw = "."
+    return raw, explicit
+
+
+def median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def cluster_means(values, min_gap=None):
+    values = sorted(values)
+    if len(values) <= 1:
+        return [float(v) for v in values]
+    if min_gap is None:
+        diffs = [b - a for a, b in itertools.pairwise(values)]
+        min_gap = max(4.0, 0.3 * max(diffs))
+    clusters, cur = [], [values[0]]
+    for v in values[1:]:
+        if v - cur[-1] > min_gap:
+            clusters.append(cur)
+            cur = []
+        cur.append(v)
+    clusters.append(cur)
+    return [sum(c) / len(c) for c in clusters]
+
+
+def parse_tree_text(text, keep_suffix=False, warn=print):
+    lines = text.splitlines()
+    flat_list = not any(find_node_marker(line)[0] is not None for line in lines)
+    candidates = []
+    warnings = []
+    for line_no, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        idx, mlen = find_node_marker(line)
+        if idx is not None:
+            raw = line[idx + mlen :].lstrip("\u2500 ")
+            if raw.strip():
+                candidates.append((line_no, idx, raw))
+            continue
+        if FOOTER_RE.fullmatch(stripped):
+            continue
+        if all(c in JUNK_LINE_CHARS for c in stripped):
+            continue
+        if flat_list:
+            candidates.append((line_no, None, stripped))
+        elif not candidates:
+            candidates.append((line_no, None, stripped))
         else:
-            self._parse_simple_format(lines)
-        self._determine_file_types()
-        return self.entries
-
-    def _detect_format(self, lines: list[str]) -> str:
-        has_tree_symbols = any(
-            any(sym in line for sym in self.TREE_SYMBOLS) for line in lines
+            warnings.append(f"line {line_no}: ignoring unrecognized line {stripped!r}")
+    marker_idxs = sorted({idx for _, idx, _ in candidates if idx is not None})
+    if marker_idxs:
+        col_to_depth = {c: k + 1 for k, c in enumerate(marker_idxs)}
+    else:
+        col_to_depth = None
+    entries = []
+    for line_no, idx, raw in candidates:
+        name, explicit = clean_name(raw, keep_suffix=keep_suffix)
+        if name is None:
+            continue
+        if idx is None:
+            depth = 1 if flat_list else 0
+        elif col_to_depth is not None:
+            depth = col_to_depth[idx]
+        else:
+            depth = 1
+        entries.append(
+            {
+                "depth": depth,
+                "name": name,
+                "is_dir": explicit,
+                "explicit_dir": explicit,
+                "line_no": line_no,
+            }
         )
-        has_indentation = any(line.startswith((" ", "\t")) for line in lines)
-        has_paths = any("/" in line or "\\" in line for line in lines)
-        if has_tree_symbols:
-            return "tree"
-        elif has_indentation:
-            return "indented"
-        else:
-            return "simple"
+    for w in warnings:
+        warn("warning: " + w)
+    return entries
 
-    def _parse_tree_format(self, lines: list[str]) -> None:
-        stack: list[tuple[int, Path]] = []
-        for line in lines:
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-            tree_matches = []
-            for sym in ["├── ", "└── ", "│   ", "    "]:
-                if line.startswith(sym):
-                    tree_matches.append((len(sym), sym))
-            if tree_matches:
-                depth = len(tree_matches) // 4
-                name = line[len(tree_matches[0][1]) :].strip()
-            else:
-                match = re.match(r"^([\s\|┌└├─]+)([^\s]+)(.*)$", line)
-                if match:
-                    prefix, name, _ = match.groups()
-                    depth = len(prefix) // 4
-                else:
-                    name = line.strip()
-                    depth = 0
-            name = self._clean_name(name)
-            if not name:
-                continue
-            if name in (".", "./", ".\\"):
-                self.entries.append(
-                    {
-                        "depth": 0,
-                        "name": ".",
-                        "is_dir": True,
-                        "explicit_dir": True,
-                        "raw": name,
-                    }
+
+def load_ocr(choice):
+    if choice in ("auto", "rapidocr"):
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+
+            engine = RapidOCR()
+
+            def run(img):
+                import numpy as np
+
+                tokens = []
+                res, _ = engine(np.array(img))
+                for box, text, score in res or []:
+                    try:
+                        conf = float(score)
+                    except (TypeError, ValueError):
+                        conf = 0.0
+                    xs = [float(p[0]) for p in box]
+                    ys = [float(p[1]) for p in box]
+                    tokens.append(
+                        (min(xs), min(ys), max(xs) - min(xs), str(text).strip(), conf)
+                    )
+                return tokens
+
+            return "rapidocr", run
+        except ImportError:
+            if choice == "rapidocr":
+                sys.exit(
+                    "error: rapidocr-onnxruntime is not installed (pip install rapidocr-onnxruntime)"
                 )
-                stack = [(0, self.base_path)]
-                continue
-            while stack and stack[-1][0] >= depth:
-                stack.pop()
-            if stack:
-                parent_path = stack[-1][1]
-                current_path = parent_path / name
-            else:
-                current_path = self.base_path / name
-            explicit_dir = name.endswith(("/", "\\"))
-            self.entries.append(
-                {
-                    "depth": depth,
-                    "name": name,
-                    "path": current_path,
-                    "is_dir": explicit_dir,
-                    "explicit_dir": explicit_dir,
-                    "raw": name,
-                }
-            )
-            if not explicit_dir:
-                stack.append((depth, current_path))
-
-    def _parse_indented_format(self, lines: list[str]) -> None:
-        stack: list[tuple[int, Path]] = []
-        for line in lines:
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-            stripped = line.lstrip()
-            indent_len = len(line) - len(stripped)
-            indent = indent_len // 4
-            name = stripped.strip()
-            name = self._clean_name(name)
-            if not name:
-                continue
-            while stack and stack[-1][0] >= indent:
-                stack.pop()
-            if stack:
-                parent_path = stack[-1][1]
-                current_path = parent_path / name
-            else:
-                current_path = self.base_path / name
-            explicit_dir = name.endswith(("/", "\\"))
-            self.entries.append(
-                {
-                    "depth": indent,
-                    "name": name,
-                    "path": current_path,
-                    "is_dir": explicit_dir,
-                    "explicit_dir": explicit_dir,
-                    "raw": name,
-                }
-            )
-            if not explicit_dir:
-                stack.append((indent, current_path))
-
-    def _parse_simple_format(self, lines: list[str]) -> None:
-        for line in lines:
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-            name = line.strip()
-            name = self._clean_name(name)
-            if not name:
-                continue
-            explicit_dir = name.endswith(("/", "\\"))
-            clean_name = name.rstrip("/\\")
-            self.entries.append(
-                {
-                    "depth": 0,
-                    "name": clean_name,
-                    "path": self.base_path / clean_name,
-                    "is_dir": explicit_dir,
-                    "explicit_dir": explicit_dir,
-                    "raw": name,
-                }
-            )
-
-    def _clean_name(self, name: str) -> str:
-        name = re.sub(r"\s+#.*$", "", name)
-        name = name.strip()
-        return name
-
-    def _determine_file_types(self) -> None:
-        for entry in self.entries:
-            if entry["explicit_dir"] or entry["name"] in (".", "./", ".\\"):
-                entry["is_dir"] = True
-        depths = [e["depth"] for e in self.entries]
-        for i, entry in enumerate(self.entries):
-            if entry["is_dir"]:
-                continue
-            if i + 1 < len(self.entries):
-                next_entry = self.entries[i + 1]
-                if next_entry["depth"] > entry["depth"]:
-                    entry["is_dir"] = True
-        for entry in self.entries:
-            if (
-                not entry["is_dir"]
-                and "." in entry["name"].split("/")[-1].split("\\")[-1]
-            ):
-                entry["is_dir"] = False
-
-
-class ImageProcessor:
-    @staticmethod
-    def is_image_file(path: Path) -> bool:
-        image_extensions = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"]
-        return path.suffix.lower() in image_extensions
-
-    @staticmethod
-    def preprocess_image(image_path: Path) -> Image.Image | None:
+    if choice in ("auto", "pytesseract"):
         try:
-            img = Image.open(image_path)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-            )
-            kernel = np.ones((2, 2), np.uint8)
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            result = Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB))
-            return result
-        except Exception as e:
-            print(f"Warning: Image preprocessing failed: {e}")
-            return None
+            import pytesseract
 
-    @staticmethod
-    def extract_text_from_image(image_path: Path) -> str:
-        if not HAS_OCR:
-            raise ImportError(
-                "OCR libraries not installed. "
-                "Install with: pip install pytesseract opencv-python pillow"
-            )
-        processed_img = ImageProcessor.preprocess_image(image_path)
-        if processed_img:
-            img_to_ocr = processed_img
-        else:
-            img_to_ocr = Image.open(image_path)
-        try:
-            custom_config = r"--oem 3 --psm 6 -c tessedit_char_whitelist=./\abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-\|"
-            text = pytesseract.image_to_string(img_to_ocr, config=custom_config)
-            return text
-        except Exception as e:
-            raise RuntimeError(f"OCR failed: {e}")
+            def run(img):
+                data = pytesseract.image_to_data(
+                    img, output_type=pytesseract.Output.DICT, config="--psm 6"
+                )
+                tokens = []
+                for i, t in enumerate(data["text"]):
+                    t = (t or "").strip()
+                    if not t:
+                        continue
+                    try:
+                        conf = float(data["conf"][i])
+                    except (TypeError, ValueError):
+                        conf = 0.0
+                    if conf < 40:
+                        continue
+                    tokens.append(
+                        (
+                            int(data["left"][i]),
+                            int(data["top"][i]),
+                            int(data["width"][i]),
+                            t,
+                            conf,
+                        )
+                    )
+                return tokens
 
-
-def read_input(source: str) -> str:
-    path = Path(source)
-    if source == "-":
-        return sys.stdin.read()
-    if not path.exists():
-        raise FileNotFoundError(f"Input not found: {source}")
-    if ImageProcessor.is_image_file(path):
-        if not HAS_OCR:
-            raise ImportError(
-                "Image input requires OCR libraries. "
-                "Install with: pip install pytesseract opencv-python pillow numpy"
-            )
-        text = ImageProcessor.extract_text_from_image(path)
-        return text
-    return path.read_text(encoding="utf-8", errors="replace")
+            return "pytesseract", run
+        except ImportError:
+            if choice == "pytesseract":
+                sys.exit(
+                    "error: pytesseract is not installed (pip install pytesseract)"
+                )
+    sys.exit(
+        "error: no OCR engine available — install one with:\n"
+        "    pip install rapidocr-onnxruntime     (recommended, self-contained)\n"
+        "  or: pip install pytesseract            (requires the tesseract binary too)"
+    )
 
 
-def create_tree(
-    entries: list[dict[str, Any]],
-    base_path: Path,
-    dry_run: bool = False,
-    verbose: bool = False,
-) -> tuple[int, int]:
-    created_dirs = 0
-    created_files = 0
-    sorted_entries = sorted(entries, key=lambda x: (x["depth"], str(x["path"])))
-    for entry in sorted_entries:
-        name = entry["name"]
-        path = entry["path"]
-        is_dir = entry["is_dir"]
-        if name == ".":
+def detect_marker_xs(img, rows, pitch, char_width):
+    width, height = img.size
+    px = img.load()
+    out = []
+    for top, parts in rows:
+        left = parts[0][0]
+        y0 = max(0, int(top - 0.35 * pitch))
+        y1 = min(height, int(top + 0.55 * pitch))
+        dark = []
+        for x in range(width):
+            is_dark = False
+            for y in range(y0, y1):
+                if px[x, y] < 180:
+                    is_dark = True
+                    break
+            dark.append(is_dark)
+        runs, i = [], 0
+        while i < width:
+            if dark[i]:
+                j = i + 1
+                while j < width and dark[j]:
+                    j += 1
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        cand = [
+            s
+            for s, e in runs
+            if 1.2 * char_width <= (e - s) <= 6 * char_width
+            and s < left - 0.2 * char_width
+        ]
+        out.append(min(cand) if cand else None)
+    return out
+
+
+def image_to_entries(path, keep_suffix=False, engine="auto"):
+    from PIL import Image, ImageOps, ImageStat
+
+    try:
+        img = Image.open(path)
+    except Exception as e:
+        sys.exit(f"error: cannot open image {path}: {e}")
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    if ImageStat.Stat(img).mean[0] < 128:
+        img = ImageOps.invert(img)
+    img = ImageOps.autocontrast(img)
+    small = min(img.size)
+    if small < 800:
+        factor = min(800 / small, 4.0)
+        img = img.resize(
+            (round(img.width * factor), round(img.height * factor)), Image.LANCZOS
+        )
+    engine_name, ocr = load_ocr(engine)
+    tokens = ocr(img)
+    raw_count = len(tokens)
+    kept = []
+    for left, top, width, text, conf in tokens:
+        if conf < 0.4:
             continue
-        try:
-            relative_path = path.relative_to(base_path)
-        except ValueError:
-            relative_path = path
-        if dry_run:
-            item_type = "dir" if is_dir else "file"
-            print(f"  [{item_type.upper()}] {relative_path}")
-            if is_dir:
-                created_dirs += 1
-            else:
-                created_files += 1
+        if JUNK_TOKEN_RE.fullmatch(text):
             continue
-        parent = path.parent
-        if not parent.exists():
-            parent.mkdir(parents=True, exist_ok=True)
-            if verbose:
-                print(f"  Created parent dir: {parent.relative_to(base_path)}/")
-        if is_dir:
-            if not path.exists():
-                path.mkdir(exist_ok=True)
-                created_dirs += 1
-                if verbose:
-                    print(f"  Created dir:  {relative_path}/")
-            else:
-                if verbose:
-                    print(f"  Exists dir:  {relative_path}/")
+        if FOOTER_RE.fullmatch(text):
+            continue
+        if text.startswith("#"):
+            continue
+        left, text = strip_leading_junk(left, text)
+        if not text.strip():
+            continue
+        kept.append((left, top, width, text.strip()))
+    tokens = kept
+    if not tokens:
+        sys.exit(f"error: OCR found no readable entries in {path}")
+    cell_widths = [
+        w / max(1, len(t)) for _l, _t, w, t, *_ in tokens if len(t) >= 2 and w > 0
+    ]
+    tokens.sort(key=lambda t: (t[1], t[0]))
+    tops = [t[1] for t in tokens]
+    top_diffs = [b - a for a, b in itertools.pairwise(tops) if b - a > 0]
+    pitch = median(top_diffs) if top_diffs else 40.0
+    row_thresh = max(6.0, 0.45 * pitch)
+    rows = []
+    for left, top, _w, text in tokens:
+        if rows and top - rows[-1][0] <= row_thresh:
+            rows[-1][1].append((left, text))
         else:
-            if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-                created_files += 1
-                if verbose:
-                    print(f"  Created file: {relative_path}")
-            else:
-                if verbose:
-                    print(f"  Exists file: {relative_path}")
-    return created_dirs, created_files
+            rows.append((top, [(left, text)]))
+    row_lefts, row_names = [], []
+    for top, parts in rows:
+        parts.sort(key=lambda p: p[0])
+        row_lefts.append(parts[0][0])
+        row_names.append(re.sub(r"\s*\.\s*", ".", "".join(p[1] for p in parts)))
+    if not cell_widths:
+        cell_widths = [pitch / 2.2]
+    char_width = median(cell_widths)
+    marker_xs = detect_marker_xs(img, rows, pitch, char_width)
+    col_gap = 0.8 * char_width
+    ocr_means = cluster_means(row_lefts, min_gap=col_gap)
+    ocr_depth = {m: k + 1 for k, m in enumerate(ocr_means)}
+    marker_means = cluster_means(
+        [m for m in marker_xs if m is not None], min_gap=col_gap
+    )
+    marker_depth = {m: k + 1 for k, m in enumerate(marker_means)}
 
+    def depth_of(i):
+        m = marker_xs[i]
+        if m is not None and marker_means:
+            nearest = min(marker_means, key=lambda x: abs(x - m))
+            return marker_depth[nearest]
+        nearest = min(ocr_means, key=lambda x: abs(x - row_lefts[i]))
+        return ocr_depth[nearest]
 
-def validate_entries(entries: list[dict[str, Any]]) -> bool:
+    entries = []
+    for i, (top, left, raw) in enumerate(
+        zip((r[0] for r in rows), row_lefts, row_names, strict=False)
+    ):
+        name, explicit = clean_name(raw, keep_suffix=keep_suffix)
+        if name is None:
+            continue
+        entries.append(
+            {
+                "depth": depth_of(i),
+                "name": name,
+                "is_dir": explicit,
+                "explicit_dir": explicit,
+                "line_no": round(top),
+            }
+        )
     if not entries:
-        print("Warning: No valid entries found in input.")
-        return False
-    has_root = any(e["name"] == "." for e in entries)
+        sys.exit(f"error: OCR found no usable entries in {path}")
+    return engine_name, entries, {"tokens": raw_count, "rows": len(rows)}
+
+
+def finalize(entries, assume_dir=False):
+    for i, e in enumerate(entries):
+        if e["name"] == ".":
+            e["is_dir"] = True
+            continue
+        if e["explicit_dir"]:
+            e["is_dir"] = True
+            continue
+        has_children = i + 1 < len(entries) and entries[i + 1]["depth"] > e["depth"]
+        if has_children or assume_dir:
+            e["is_dir"] = True
+        else:
+            e["is_dir"] = False
+
+
+def ambiguous_notes(entries, assume_dir=False):
+    notes = []
+    ambiguous = [
+        e["name"]
+        for i, e in enumerate(entries)
+        if e["name"] != "."
+        and not e["explicit_dir"]
+        and not (i + 1 < len(entries) and entries[i + 1]["depth"] > e["depth"])
+    ]
+    if ambiguous:
+        n = len(ambiguous)
+        noun = "entry" if n == 1 else "entries"
+        if assume_dir:
+            notes.append(
+                f"{n} {noun} had no visible children -> created as director{'y' if n == 1 else 'ies'} (--assume-dir)"
+            )
+        else:
+            notes.append(
+                f"{n} {noun} had no visible children -> created as "
+                f"file{'s' if n != 1 else ''}; re-run with --assume-dir "
+                "to make them directories"
+            )
+    return notes
+
+
+def _unsafe_name(name):
+    p = Path(name)
+    return (
+        not name
+        or "\\" in name
+        or p.is_absolute()
+        or any(part in ("", ".", "..") for part in p.parts)
+    )
+
+
+def create_tree(entries, base_dir: Path, dry_run=False):
+    base_dir = base_dir.resolve()
+    if not dry_run:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    stack = []
+    counts = {"dirs": 0, "files": 0, "existing": 0, "skipped": 0}
     for entry in entries:
-        if "path" not in entry:
-            print(f"Warning: Entry missing path: {entry}")
-            return False
-    return True
+        depth = entry["depth"]
+        name = entry["name"]
+        is_dir = entry["is_dir"]
+        prefix = "DRYRUN " if dry_run else ""
+        if name == ".":
+            if not stack:
+                stack.append((0, base_dir))
+            continue
+        if _unsafe_name(name):
+            print(f"{prefix}SKIP  unsafe path: {name!r}", file=sys.stderr)
+            counts["skipped"] += 1
+            continue
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        parent = stack[-1][1] if stack else base_dir
+        target = parent / name
+        if is_dir:
+            try:
+                already = not dry_run and target.exists()
+                if not dry_run and not already:
+                    target.mkdir(parents=True, exist_ok=True)
+                rel = target.relative_to(base_dir) if target != base_dir else Path(".")
+                if already:
+                    print(f"EXIST {rel}/")
+                    counts["existing"] += 1
+                else:
+                    print(f"{prefix}DIR   {rel}/")
+                    counts["dirs"] += 1
+            except Exception as e:
+                print(f"Failed to create dir {target}: {e}", file=sys.stderr)
+                counts["skipped"] += 1
+                continue
+            stack.append((depth, target))
+        else:
+            try:
+                if not dry_run:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                if not dry_run and target.exists():
+                    print(f"EXIST {target.relative_to(base_dir)}")
+                    counts["existing"] += 1
+                else:
+                    if not dry_run:
+                        target.touch()
+                    print(f"{prefix}FILE  {target.relative_to(base_dir)}")
+                    counts["files"] += 1
+            except Exception as e:
+                print(f"Failed to create file {target}: {e}", file=sys.stderr)
+                counts["skipped"] += 1
+    return counts
+
+
+def detect_mode(path: Path):
+    if path.suffix.lower() in IMG_EXTS:
+        return "image"
+    try:
+        head = path.open("rb").read(16)
+        magics = (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF8",
+            b"RIFF",
+            b"BM",
+            b"II*\x00",
+            b"MM\x00*",
+        )
+        if any(head.startswith(m) for m in magics):
+            return "image"
+    except OSError:
+        pass
+    return "text"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create folder tree from text file or image",
+        prog="tree2fs",
+        description="Recreate a directory tree from a `tree` listing (text) or a screenshot of one (OCR).",
+        epilog=(
+            "examples:\n"
+            "  tree2fs tree.txt                     # build from a text listing\n"
+            "  tree2fs screenshot.png               # build from a screenshot (OCR)\n"
+            "  tree2fs tree.txt --base /tmp/out     # build elsewhere\n"
+            "  tree2fs tree.txt -d -n               # ambiguous entries as dirs, dry run"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python create_tree.py tree.txt
-  python create_tree.py folder_tree.png
-  python create_tree.py tree.txt --output ./my_project
-  python create_tree.py tree.txt --dry-run
-  python create_tree.py tree.txt -v
-        """,
+    )
+    parser.add_argument("input", type=Path, help="text listing or screenshot image")
+    parser.add_argument(
+        "--base",
+        type=Path,
+        default=Path.cwd(),
+        help="directory to build the tree in (default: current directory)",
     )
     parser.add_argument(
-        "input",
-        nargs="?",
-        default="-",
-        help='Input file (text or image) or "-" for stdin',
+        "-d",
+        "--assume-dir",
+        action="store_true",
+        help="entries without visible children are created as directories (default: files)",
     )
     parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
-        default=".",
-        help="Output directory (default: current directory)",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Show detailed output"
-    )
-    parser.add_argument(
+        "-n",
         "--dry-run",
         action="store_true",
-        help="Show what would be created without creating",
+        help="print the plan without creating anything",
     )
     parser.add_argument(
-        "--force", action="store_true", help="Overwrite existing files/directories"
-    )
-    parser.add_argument(
-        "--format",
-        choices=["auto", "tree", "simple", "indented"],
+        "--engine",
+        choices=("auto", "rapidocr", "pytesseract"),
         default="auto",
-        help="Force a specific input format (default: auto-detect)",
+        help="OCR engine (default: auto)",
+    )
+    parser.add_argument(
+        "--keep-suffix",
+        action="store_true",
+        help="keep tree -F suffixes (* @ = |) in names",
     )
     args = parser.parse_args()
-    try:
-        text = read_input(args.input)
-    except Exception as e:
-        print(f"Error reading input: {e}", file=sys.stderr)
+    input_path = args.input
+    if not input_path.is_file():
+        print(f"error: input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
-    if args.verbose:
-        print(f"Input: {args.input}")
-        print(f"Output: {args.output}")
-        print(f"Format: {args.format}")
-        print(f"Text length: {len(text)} characters")
-        print()
-    base_path = Path(args.output).resolve()
-    parser = TreeParser(base_path)
-    entries = parser.parse(text)
-    if not validate_entries(entries):
-        print("No valid tree structure found in input.")
-        sys.exit(1)
-    if args.verbose:
-        print(f"Parsed {len(entries)} entries:")
-        for entry in entries:
-            if entry["name"] != ".":
-                item_type = "DIR" if entry["is_dir"] else "FILE"
-                print(f"  [{item_type}] depth={entry['depth']} {entry['name']}")
-        print()
-    created_dirs, created_files = create_tree(
-        entries, base_path, dry_run=args.dry_run, verbose=args.verbose
-    )
-    if args.dry_run:
+    if detect_mode(input_path) == "image":
+        engine_name, entries, stats = image_to_entries(
+            input_path, keep_suffix=args.keep_suffix, engine=args.engine
+        )
         print(
-            f"\n[DRY RUN] Would create {created_dirs} directories and {created_files} files"
+            f"OCR ({engine_name}): {stats['rows']} rows from {stats['tokens']} raw tokens"
         )
     else:
-        print(
-            f"\nCreated {created_dirs} directories and {created_files} files in: {base_path}"
-        )
+        try:
+            text = input_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"error: cannot read {input_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+        entries = parse_tree_text(text, keep_suffix=args.keep_suffix)
+        print(f"Text: parsed {len(entries)} entries")
+    if not entries:
+        print("error: no entries found in input.", file=sys.stderr)
+        sys.exit(1)
+    finalize(entries, assume_dir=args.assume_dir)
+    for note in ambiguous_notes(entries, assume_dir=args.assume_dir):
+        print("note: " + note)
+    counts = create_tree(entries, args.base, dry_run=args.dry_run)
+    what = "Would create" if args.dry_run else "Created"
+    print(
+        f"{what} {counts['dirs']} dir(s), {counts['files']} file(s)"
+        f" ({counts['existing']} already existed, {counts['skipped']} skipped)."
+    )
 
 
 if __name__ == "__main__":
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
     main()

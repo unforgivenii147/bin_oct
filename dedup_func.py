@@ -71,6 +71,7 @@ except ImportError:  # pragma: no cover
 # Shared helpers
 # ===========================================================================
 
+
 def iter_python_files(root: Path, exclude_paths: Iterable[Path] = ()) -> list[Path]:
     """Recursively yield ``*.py`` files under ``root``.
 
@@ -135,6 +136,7 @@ def function_line_range(node: ast.AST) -> tuple[int, int]:
 # ===========================================================================
 # Subcommand: single  (dedupfunc.py)
 # ===========================================================================
+
 
 class FunctionRecord:
     """A discovered function definition with its normalized body key."""
@@ -298,6 +300,7 @@ def cmd_single(args: argparse.Namespace) -> int:
 # Subcommand: scan  (dup_detector.py)
 # ===========================================================================
 
+
 def extract_objects_from_file(path: Path) -> list[dict[str, Any]]:
     """Extract top-level functions/classes/constants with source + sha256."""
     src, tree = parse_file(path)
@@ -364,10 +367,18 @@ def save_scan_reports(
     for h, objs in groups.items():
         count = len(objs)
         for obj in objs:
-            rec = {k: obj[k] for k in (
-                "object_type", "object_name", "source_code", "reference_file",
-                "content_hash", "start_line", "end_line",
-            )}
+            rec = {
+                k: obj[k]
+                for k in (
+                    "object_type",
+                    "object_name",
+                    "source_code",
+                    "reference_file",
+                    "content_hash",
+                    "start_line",
+                    "end_line",
+                )
+            }
             rec["occurrence_count"] = count
             flat.append(rec)
 
@@ -388,12 +399,16 @@ def save_scan_reports(
     for obj_type, fname in per_type.items():
         subset = [o for o in flat if o["object_type"] == obj_type]
         (output_dir / fname).write_text(json.dumps(subset, indent=4), encoding="utf-8")
-        print(f"[+] Saved {len(subset)} {obj_type} duplicate instances to {output_dir / fname}")
+        print(
+            f"[+] Saved {len(subset)} {obj_type} duplicate instances to {output_dir / fname}"
+        )
 
     (output_dir / "exact_duplicates.json").write_text(
         json.dumps(flat, indent=4), encoding="utf-8"
     )
-    print(f"[+] Saved {len(flat)} exact duplicate instances to {output_dir / 'exact_duplicates.json'}")
+    print(
+        f"[+] Saved {len(flat)} exact duplicate instances to {output_dir / 'exact_duplicates.json'}"
+    )
 
 
 def refactor_to_shared_module(
@@ -402,7 +417,9 @@ def refactor_to_shared_module(
     min_occurrences: int,
 ) -> None:
     """Move hot duplicates into ``shared_module`` and update importers."""
-    content = shared_module.read_text(encoding="utf-8") if shared_module.exists() else ""
+    content = (
+        shared_module.read_text(encoding="utf-8") if shared_module.exists() else ""
+    )
     imports_to_add: dict[str, set[str]] = defaultdict(set)
 
     for objs in groups.values():
@@ -460,10 +477,14 @@ def find_fuzzy_duplicates(
         import ssdeep  # type: ignore
         from rapidfuzz import fuzz  # type: ignore
     except ImportError:
-        logger.error("Please install dependencies for --fuzzy: pip install ssdeep rapidfuzz")
+        logger.error(
+            "Please install dependencies for --fuzzy: pip install ssdeep rapidfuzz"
+        )
         return
 
-    print("[*] Calculating fuzzy similarities (this may take a while for large codebases)...")
+    print(
+        "[*] Calculating fuzzy similarities (this may take a while for large codebases)..."
+    )
     n = len(objects)
     pairs: list[dict[str, Any]] = []
     for i in range(n):
@@ -481,12 +502,16 @@ def find_fuzzy_duplicates(
                 pairs.append(
                     {
                         "object_1": {
-                            "type": a["object_type"], "name": a["object_name"],
-                            "file": a["reference_file"], "source_code": a["source_code"],
+                            "type": a["object_type"],
+                            "name": a["object_name"],
+                            "file": a["reference_file"],
+                            "source_code": a["source_code"],
                         },
                         "object_2": {
-                            "type": b["object_type"], "name": b["object_name"],
-                            "file": b["reference_file"], "source_code": b["source_code"],
+                            "type": b["object_type"],
+                            "name": b["object_name"],
+                            "file": b["reference_file"],
+                            "source_code": b["source_code"],
                         },
                         "similarity_percentage": round(ratio, 2),
                         "ssdeep_score": score,
@@ -540,6 +565,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 # ===========================================================================
 # Subcommand: consolidate  (find_dup_func_class_const.py)
 # ===========================================================================
+
 
 def extract_definitions(
     path: Path,
@@ -626,7 +652,9 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
         return 0
 
     print(f"🔍 Scanning {len(files)} files concurrently...")
-    groups: dict[tuple[str, str, str], list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[tuple[str, dict[str, Any]]]] = defaultdict(
+        list
+    )
     workers = args.workers or os.cpu_count() or 1
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as ex:
@@ -659,14 +687,18 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
         return 0
 
     print("🛠️  Processing Consolidation (-m flag active)...")
-    existing = shared_module.read_text(encoding="utf-8") if shared_module.exists() else ""
+    existing = (
+        shared_module.read_text(encoding="utf-8") if shared_module.exists() else ""
+    )
     merged = existing + "\n\n" + "\n\n".join(sources_to_move)
     try:
         ast.parse(merged)
         shared_module.write_text(merged, encoding="utf-8")
         print(f"✅ Extracted duplicate definitions safely written to: {shared_module}")
     except Exception as e:
-        print(f"❌ Aborted: Merged definitions inside {shared_module} failed AST parsing: {e}")
+        print(
+            f"❌ Aborted: Merged definitions inside {shared_module} failed AST parsing: {e}"
+        )
         return 1
 
     module_name = shared_module.stem
@@ -681,7 +713,9 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
             print(f"✅ In-place code updated & verified: {path_str}")
             updated += 1
         except Exception as e:
-            print(f"❌ Failed to parse or modify file safely {path_str}: {e}. Skipping.")
+            print(
+                f"❌ Failed to parse or modify file safely {path_str}: {e}. Skipping."
+            )
 
     print(f"\n📊 Refactor complete. Adjusted and verified {updated} files.")
     return 0
@@ -690,6 +724,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
 # ===========================================================================
 # Subcommand: prune  (remove_duplicate_functions.py)
 # ===========================================================================
+
 
 def _hash_function(node: ast.FunctionDef, lines: list[str]) -> str:
     """md5 over (ast-dumped signature + return type + dedented body)."""
@@ -815,7 +850,11 @@ def cmd_prune(args: argparse.Namespace) -> int:
     ref_hashes = {info["hash"]: info["name"] for info in ref_funcs.values()}
     print(f"  Found {len(ref_hashes)} functions")
 
-    targets = [t for t in _collect_prune_targets(args.inputs) if t.resolve() != ref_path.resolve()]
+    targets = [
+        t
+        for t in _collect_prune_targets(args.inputs)
+        if t.resolve() != ref_path.resolve()
+    ]
     if not targets:
         logger.warning("⚠️  No target files found")
         return 0
@@ -864,6 +903,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
 # CLI plumbing
 # ===========================================================================
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dedup_tool.py",
@@ -877,10 +917,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Find / remove duplicate functions in ONE file (dedupfunc.py).",
     )
     p.add_argument("file", help="Python file to analyze.")
-    p.add_argument("-r", "--remove", action="store_true",
-                   help="Interactively remove duplicates (keep one per group).")
-    p.add_argument("--backup", action="store_true",
-                   help="Create a .backup copy before removing (implies removal flow).")
+    p.add_argument(
+        "-r",
+        "--remove",
+        action="store_true",
+        help="Interactively remove duplicates (keep one per group).",
+    )
+    p.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a .backup copy before removing (implies removal flow).",
+    )
     p.set_defaults(func=cmd_single)
 
     # --- scan -------------------------------------------------------------
@@ -889,20 +936,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recursive exact/fuzzy duplicate scanner (dup_detector.py).",
     )
     p.add_argument("path", nargs="?", default=".", help="Root path (default: .).")
-    p.add_argument("-o", "--output-dir", default=".",
-                   help="Directory for JSON reports (default: .).")
-    p.add_argument("--refactor", action="store_true",
-                   help="Move heavy duplicates into the shared module.")
-    p.add_argument("--shared-module", default="utils.py",
-                   help="Shared module path for --refactor (default: utils.py).")
-    p.add_argument("--threshold", type=int, default=5,
-                   help="Refactor only duplicates appearing MORE than N times (default: 5).")
-    p.add_argument("--fuzzy", action="store_true",
-                   help="Also compute fuzzy duplicate pairs (requires ssdeep + rapidfuzz).")
-    p.add_argument("--similarity", type=float, default=50.0,
-                   help="Fuzzy similarity threshold in %% (default: 50).")
-    p.add_argument("--workers", type=int, default=None,
-                   help="Parallel worker count (default: CPU count).")
+    p.add_argument(
+        "-o",
+        "--output-dir",
+        default=".",
+        help="Directory for JSON reports (default: .).",
+    )
+    p.add_argument(
+        "--refactor",
+        action="store_true",
+        help="Move heavy duplicates into the shared module.",
+    )
+    p.add_argument(
+        "--shared-module",
+        default="utils.py",
+        help="Shared module path for --refactor (default: utils.py).",
+    )
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help="Refactor only duplicates appearing MORE than N times (default: 5).",
+    )
+    p.add_argument(
+        "--fuzzy",
+        action="store_true",
+        help="Also compute fuzzy duplicate pairs (requires ssdeep + rapidfuzz).",
+    )
+    p.add_argument(
+        "--similarity",
+        type=float,
+        default=50.0,
+        help="Fuzzy similarity threshold in %% (default: 50).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel worker count (default: CPU count).",
+    )
     p.set_defaults(func=cmd_scan)
 
     # --- consolidate ------------------------------------------------------
@@ -911,12 +983,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consolidate exact duplicates into a shared module (find_dup_func_class_const.py).",
     )
     p.add_argument("path", nargs="?", default=".", help="Root path (default: .).")
-    p.add_argument("-m", "--move", action="store_true",
-                   help="Actually move duplicates and rewrite imports.")
-    p.add_argument("--shared-module", default="dh.py",
-                   help="Shared module filename (default: dh.py).")
-    p.add_argument("--workers", type=int, default=None,
-                   help="Parallel worker count (default: CPU count).")
+    p.add_argument(
+        "-m",
+        "--move",
+        action="store_true",
+        help="Actually move duplicates and rewrite imports.",
+    )
+    p.add_argument(
+        "--shared-module",
+        default="dh.py",
+        help="Shared module filename (default: dh.py).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel worker count (default: CPU count).",
+    )
     p.set_defaults(func=cmd_consolidate)
 
     # --- prune ------------------------------------------------------------
@@ -925,12 +1008,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove functions matching a reference file (remove_duplicate_functions.py).",
     )
     p.add_argument("reference", help="Reference file (functions to keep).")
-    p.add_argument("inputs", nargs="*",
-                   help="Target files/directories (default: current directory).")
-    p.add_argument("-a", "--apply", action="store_true",
-                   help="Apply changes (default: dry-run).")
-    p.add_argument("--workers", type=int, default=8,
-                   help="Parallel worker count (default: 8).")
+    p.add_argument(
+        "inputs",
+        nargs="*",
+        help="Target files/directories (default: current directory).",
+    )
+    p.add_argument(
+        "-a", "--apply", action="store_true", help="Apply changes (default: dry-run)."
+    )
+    p.add_argument(
+        "--workers", type=int, default=8, help="Parallel worker count (default: 8)."
+    )
     p.set_defaults(func=cmd_prune)
 
     return parser

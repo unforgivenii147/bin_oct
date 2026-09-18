@@ -187,9 +187,19 @@ def compress_files(file_paths):
     cprint(f"Compressed {len(parsed_trees)} file(s).")
 
 
+def get_python_files():
+    """Recursively find all .py files in current directory."""
+    return [str(p) for p in Path(".").rglob("*.py") if p.is_file()]
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python compressor.py <file1.py> [file2.py ...]")
-        sys.exit(1)
-
-    compress_files(sys.argv[1:])
+        # No CLI args provided - process current directory recursively
+        files = get_python_files()
+        if not files:
+            print("No Python files found in current directory.")
+            sys.exit(0)
+        print(f"Processing {len(files)} Python files from current directory...")
+        compress_files(files)
+    else:
+        compress_files(sys.argv[1:])
