@@ -27,7 +27,7 @@ import sys
 from collections.abc import Iterable
 from multiprocessing import Pool
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Optional
 
 from loguru import logger
 from tqdm import tqdm

@@ -1,6 +1,5 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 from pathlib import Path
-import sys
 
 
 if __name__ == "__main__":

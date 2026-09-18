@@ -3,7 +3,6 @@
 
 import shutil
 import subprocess
-import sys
 from multiprocessing.pool import Pool
 from pathlib import Path
 from typing import Final, NamedTuple

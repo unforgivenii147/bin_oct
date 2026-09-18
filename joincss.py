@@ -8,9 +8,7 @@ from pathlib import Path
 LOCAL_FONT_BASE = Path("/sdcard/_static/fonts")
 FONTEXTS = {".woff", ".woff2", ".ttf", ".otf", ".eot"}
 IMGEXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
-IMPORT_RE = re.compile(
-    "@import\\s+url\\([^)]+fonts\\.googleapis[^)]+\\);?", re.IGNORECASE
-)
+IMPORT_RE = re.compile(r"@import\s+url\([^)]+fonts\.googleapis[^)]+\);?", re.IGNORECASE)
 FAMILY_RULES = {
     "roboto": "roboto",
     "lato": "lato",

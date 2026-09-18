@@ -4,157 +4,144 @@ from __future__ import annotations
 import ast
 import shutil
 import sys
-from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
-RE_FUNCTIONS = {
-    "compile",
-    "search",
-    "match",
-    "fullmatch",
-    "split",
-    "findall",
-    "finditer",
-    "sub",
-    "subn",
-}
-REGEX_INDICATORS = {
-    "\\d",
-    "\\w",
-    "\\s",
-    "\\S",
-    "\\W",
-    "\\D",
-    "[",
-    "]",
-    "(",
-    ")",
-    "|",
-    "^",
-    "$",
-    "+",
-    "*",
-    "?",
-    "{",
-    "}",
-    ".",
-    "\\b",
-    "\\B",
-    "\\A",
-    "\\Z",
-    "\\z",
-    "\\1",
-    "\\2",
-    "\\3",
-    "\\4",
-    "\\5",
-    "\\6",
-    "\\7",
-    "\\8",
-    "\\9",
-}
-STRING_ESCAPES = {"\\n", "\\t", "\\r", "\\f", "\\v", "\\\\", "\\'", '\\"', "\\a", "\\b"}
+
+# re functions whose FIRST positional argument is a regex pattern.
+RE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "compile",
+        "search",
+        "match",
+        "fullmatch",
+        "split",
+        "findall",
+        "finditer",
+        "sub",
+        "subn",
+    }
+)
+
+# Characters that may appear as a string-literal prefix (r, b, f, u, …).
+STRING_PREFIX_CHARS: frozenset[str] = frozenset("rRbBuUfF")
 
 
-@dataclass
-class StringInfo:
-    value: str
-    lineno: int
-    col_offset: int
-    end_col: int
-    is_raw: bool = False
-    is_fstring: bool = False
-    quote_char: str = '"'
+def needs_raw_string(value: str, quote_char: str) -> bool:
+    """True iff `value` (the *parsed* content of a string literal) can be
+    re-emitted as a raw literal delimited by `quote_char` with the SAME value.
 
+    The whole point: if the parsed value contains a real backslash, then a
+    normal literal had to write it as `\\\\`. A raw literal can write it as
+    `\\`, which is what we want for regexes.
 
-def needs_raw_string(string_content: str) -> bool:
-    if not string_content:
+    Rules:
+      • value must contain at least one backslash   (otherwise nothing to gain)
+      • value must not END in a backslash           (would escape the quote)
+      • delimiter must not appear in value          (else we can't use it)
+      • no literal newlines                         (single-line raw only)
+    """
+    if "\\" not in value:  # parsed value has no backslash
         return False
-    has_regex_pattern = any(
-        indicator in string_content for indicator in REGEX_INDICATORS
-    )
-    escape_count = 0
-    i = 0
-    while i < len(string_content) - 1:
-        if string_content[i] == "\\":
-            if string_content[i + 1] in "\\abfnrtv\"'":
-                escape_count += 1
-                if escape_count >= 2 or (escape_count >= 1 and has_regex_pattern):
-                    return True
-            i += 1
-        i += 1
-    return False
+    if value.endswith("\\"):  # r"foo\"  → the \" would break
+        return False
+    if quote_char in value:  # delimiter appears → can't use it
+        return False
+    if "\n" in value or "\r" in value:  # real newline in value
+        return False
+    return True
 
 
 def extract_and_convert_strings(content: str) -> str | None:
+    """Rewrite regex string literals in `content` as raw strings.
+
+    Returns the new source, or `None` if nothing changed / parse failed.
+    """
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    conversions = []
+
+    # ── 1. Walk the AST, collect every re.<fn>(<str-literal>, ...) site ─────
+    conversions: list[tuple[int, int, int, str]] = []  # (line, col, end, value)
 
     class RegexStringVisitor(ast.NodeVisitor):
         def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
             if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and (node.func.value.id == "re")
-                and (node.func.attr in RE_FUNCTIONS)
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "re"
+                and func.attr in RE_FUNCTIONS
                 and node.args
             ):
                 arg = node.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    is_raw = False
-                    is_fstring = False
-                    if hasattr(arg, "lineno") and hasattr(arg, "col_offset"):
-                        string_val = arg.value
-                        if needs_raw_string(string_val):
-                            conversions.append(
-                                {
-                                    "lineno": arg.lineno,
-                                    "col_offset": arg.col_offset,
-                                    "end_col": arg.end_col_offset,
-                                    "value": string_val,
-                                    "is_raw": is_raw,
-                                    "is_fstring": is_fstring,
-                                }
-                            )
+                # Only plain string literals. (f-strings are JoinedStr,
+                # bytes are Constant[bytes] — both filtered out here.)
+                if (
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and arg.end_col_offset is not None
+                ):
+                    conversions.append(
+                        (arg.lineno, arg.col_offset, arg.end_col_offset, arg.value)
+                    )
             self.generic_visit(node)
 
-    visitor = RegexStringVisitor()
-    visitor.visit(tree)
+    RegexStringVisitor().visit(tree)
+
     if not conversions:
         return None
+
+    # ── 2. Apply edits right-to-left per line so earlier offsets stay valid ──
     lines = content.split("\n")
     converted = False
-    conversions.sort(key=lambda x: (x["lineno"], -x["col_offset"]))
-    for conv in conversions:
-        line_idx = conv["lineno"] - 1
-        if line_idx >= len(lines):
+
+    # Sort so that, on the same line, we process the rightmost first.
+    conversions.sort(key=lambda c: (c[0], -c[1]))
+
+    for lineno, col_start, col_end, value in conversions:
+        li = lineno - 1
+        if not (0 <= li < len(lines)):
             continue
-        line = lines[line_idx]
-        col_start = conv["col_offset"]
-        col_end = conv["end_col"]
-        original_literal = line[col_start:col_end]
-        if original_literal.startswith(('r"', "r'", 'r"""', "r'''")):
+
+        line = lines[li]
+        original = line[col_start:col_end]
+
+        # ── parse prefix (r / b / f / u combinations) ───────────────────
+        i = 0
+        while i < len(original) and original[i] in STRING_PREFIX_CHARS:
+            i += 1
+        prefix = original[:i]
+
+        # Already raw → skip.  Bytes → not our problem.  f-string → skip.
+        if "r" in prefix.lower() or "b" in prefix.lower() or "f" in prefix.lower():
             continue
-        if original_literal.startswith(('"""', "'''")):
+
+        if i >= len(original):
             continue
-        quote_char = original_literal[0] if original_literal else '"'
-        if quote_char not in ['"', "'"]:
+        quote = original[i]  # ' or "
+        if quote not in ("'", '"'):
             continue
-        escaped_value = conv["value"]
-        new_literal = f"r{quote_char}{escaped_value}{quote_char}"
-        new_line = line[:col_start] + new_literal + line[col_end:]
-        lines[line_idx] = new_line
+        # Leave triple-quoted literals alone (different rules).
+        if original[i : i + 3] in ('"""', "'''"):
+            continue
+
+        # ── decide ──────────────────────────────────────────────────────
+        if not needs_raw_string(value, quote):
+            continue
+
+        new_literal = f"r{quote}{value}{quote}"
+        lines[li] = line[:col_start] + new_literal + line[col_end:]
         converted = True
+
     if not converted:
         return None
     return "\n".join(lines)
 
 
 def validate_python_file(content: str) -> bool:
+    """Return True iff `content` parses as valid Python."""
     try:
         ast.parse(content)
         return True
@@ -163,17 +150,24 @@ def validate_python_file(content: str) -> bool:
 
 
 def process_file(path: Path, create_backup: bool = True) -> tuple[Path, bool, str]:
+    """Convert one file. Returns (path, success, human-readable message)."""
     try:
         original_content = path.read_text(encoding="utf-8")
     except Exception as e:
         return (path, False, f"Failed to read: {e}")
+
+    # Cheap pre-filter: without any `re.` there can be no target calls.
     if "re." not in original_content:
         return (path, True, "No re calls found")
+
     converted_content = extract_and_convert_strings(original_content)
     if converted_content is None:
         return (path, True, "No changes needed")
+
+    # Never write broken code.
     if not validate_python_file(converted_content):
         return (path, False, "Validation failed - syntax error after conversion")
+
     try:
         if create_backup:
             backup_path = path.with_suffix(path.suffix + ".backup")
@@ -185,7 +179,10 @@ def process_file(path: Path, create_backup: bool = True) -> tuple[Path, bool, st
 
 
 def collect_python_files(inputs: list[Path]) -> list[Path]:
-    python_files = set()
+    """Recursively collect .py files, skipping virtualenvs / caches."""
+    skip_dirs = {".venv", "venv", "env", "__pycache__", ".git", "node_modules"}
+    python_files: set[Path] = set()
+
     for input_path in inputs:
         if not input_path.exists():
             print(f"Warning: Path does not exist: {input_path}", file=sys.stderr)
@@ -194,48 +191,54 @@ def collect_python_files(inputs: list[Path]) -> list[Path]:
             if input_path.suffix == ".py":
                 python_files.add(input_path)
         elif input_path.is_dir():
-            skip_dirs = {".venv", "venv", "env", "__pycache__", ".git", "node_modules"}
             for py_file in input_path.rglob("*.py"):
                 if any(part in skip_dirs for part in py_file.parts):
                     continue
                 python_files.add(py_file)
+
     return sorted(python_files)
 
 
-def parse_arguments():
+def parse_arguments() -> tuple[list[Path], bool, int]:
+    """Return (paths, create_backup, num_workers)."""
     args = sys.argv[1:]
-    if not args:
-        return ([], True)
+
     create_backup = True
     if "--no-backup" in args:
         create_backup = False
         args.remove("--no-backup")
+
     num_workers = min(cpu_count(), 4)
-    for i, arg in enumerate(args):
-        if arg == "--workers" and i + 1 < len(args):
+    if "--workers" in args:
+        i = args.index("--workers")
+        if i + 1 < len(args):
             try:
                 num_workers = int(args[i + 1])
-                args.pop(i)
-                args.pop(i)
             except ValueError:
                 pass
-            break
-    paths = [Path(arg).resolve() for arg in args] if args else [Path.cwd()]
+            args.pop(i + 1)  # value
+            args.pop(i)  # flag
+
+    paths = [Path(a).resolve() for a in args] if args else [Path.cwd()]
     return (paths, create_backup, num_workers)
 
 
-def main():
+def main() -> int:
     paths, create_backup, num_workers = parse_arguments()
     python_files = collect_python_files(paths)
+
     if not python_files:
         print("No Python files found")
-        return
+        return 1
+
     print(f"Found {len(python_files)} Python files")
     print(f"Processing with {num_workers} workers")
-    print(f"Backup: {('Enabled' if create_backup else 'Disabled')}")
+    print(f"Backup: {'Enabled' if create_backup else 'Disabled'}")
     print(f"Target re functions: {', '.join(sorted(RE_FUNCTIONS))}\n")
-    results = []
+
+    results: list[tuple[Path, bool, str]] = []
     total = len(python_files)
+
     if num_workers > 1:
         with Pool(processes=num_workers) as pool:
             results = pool.starmap(
@@ -246,23 +249,28 @@ def main():
             if i % 100 == 0:
                 print(f"Progress: {i}/{total}", flush=True)
             results.append(process_file(path, create_backup))
-    successful = sum((1 for _, success, _ in results if success))
-    changed = sum((1 for _, success, msg in results if success and "Converted" in msg))
+
+    successful = sum(1 for _, ok, _ in results if ok)
+    changed = sum(1 for _, ok, m in results if ok and "Converted" in m)
+
     print("\n" + "=" * 40)
-    for path, success, message in results:
-        status = "✓" if success else "✗"
+    for path, ok, message in results:
+        mark = "✓" if ok else "✗"
         try:
-            rel_path = path.relative_to(Path.cwd())
+            shown: Path | str = path.relative_to(Path.cwd())
         except ValueError:
-            rel_path = path
-        print(f"{status} {rel_path}: {message}")
+            shown = path
+        print(f"{mark} {shown}: {message}")
     print("-" * 40)
+
     print("\nSummary:")
     print(f"  Total files: {len(python_files)}")
     print(f"  Processed successfully: {successful}")
     print(f"  Files converted: {changed}")
     if not create_backup:
         print("\n⚠️  Backup disabled. Use --no-backup with caution.")
+
+    return 0
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from urllib.request import urlopen
 
 # Supported extensions
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}

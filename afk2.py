@@ -116,7 +116,7 @@ def _collect_used_names(tree: ast.Module) -> set[str]:
             if isinstance(root, ast.Name):
                 used.add(root.id)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            for tok in re.findall("\\b([A-Za-z_]\\w*)\\b", node.value):
+            for tok in re.findall(r"\b([A-Za-z_]\w*)\b", node.value):
                 used.add(tok)
     return used
 
@@ -191,7 +191,7 @@ def analyze_source(
 
 
 def _remove_names_from_import_line(line: str, names_to_remove: set[str]) -> str | None:
-    m = re.match("^(\\s*import\\s+)(.+)$", line)
+    m = re.match(r"^(\s*import\s+)(.+)$", line)
     if m:
         prefix, rest = (m.group(1), m.group(2))
         kept = [
@@ -202,10 +202,10 @@ def _remove_names_from_import_line(line: str, names_to_remove: set[str]) -> str 
         if not kept:
             return None
         return prefix + ", ".join(kept)
-    m = re.match("^(\\s*from\\s+[\\w.]+\\s+import\\s+)(.+)$", line)
+    m = re.match(r"^(\s*from\s+[\w.]+\s+import\s+)(.+)$", line)
     if m:
         prefix, rest = (m.group(1), m.group(2))
-        rest_clean = re.sub("\\s*#.*$", "", rest).rstrip(" \\")
+        rest_clean = re.sub(r"\s*#.*$", "", rest).rstrip(" \\")
         kept = [
             seg.strip()
             for seg in rest_clean.split(",")
@@ -218,23 +218,21 @@ def _remove_names_from_import_line(line: str, names_to_remove: set[str]) -> str 
 
 
 def _alias_local_name(segment: str) -> str:
-    m = re.match("^\\s*[\\w.]+\\s+as\\s+(\\w+)\\s*$", segment)
+    m = re.match(r"^\s*[\w.]+\s+as\s+(\w+)\s*$", segment)
     if m:
         return m.group(1)
     return segment.strip().split(".")[0].strip()
 
 
 def _fix_multiline_import(block: str, names_to_remove: set[str]) -> str | None:
-    header_m = re.match(
-        "^(\\s*from\\s+[\\w.]+\\s+import\\s*$)(.*?)($.*)", block, re.DOTALL
-    )
+    header_m = re.match(r"^(\s*from\s+[\w.]+\s+import\s*$)(.*?)($.*)", block, re.DOTALL)
     if not header_m:
         return None
     prefix = header_m.group(1)
     body = header_m.group(2)
     suffix = header_m.group(3)
     kept_segments: list[str] = []
-    for seg in re.split(",\\s*", body):
+    for seg in re.split(r",\s*", body):
         seg_clean = re.sub("#.*", "", seg).strip()
         if not seg_clean:
             continue

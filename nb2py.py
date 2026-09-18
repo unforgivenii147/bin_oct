@@ -26,7 +26,7 @@ import sys
 from collections.abc import Iterable, Sequence
 from multiprocessing import Pool
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import nbformat
 from loguru import logger

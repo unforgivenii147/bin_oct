@@ -14,7 +14,6 @@ import argparse
 import re
 import stat
 from collections.abc import Sequence
-from functools import partial
 from multiprocessing.pool import AsyncResult, Pool
 from pathlib import Path
 from typing import Final

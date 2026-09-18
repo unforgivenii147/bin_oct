@@ -25,7 +25,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import xxhash
 from loguru import logger

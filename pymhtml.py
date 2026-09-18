@@ -106,7 +106,7 @@ def process_file(path) -> None:
         if ctype == "text/html":
             continue
         ext = None
-        m = re.match("^[^/]+/([^;\\\\s]+)", ctype)
+        m = re.match(r"^[^/]+/([^;\\s]+)", ctype)
         if m:
             ext = m.group(1)
         if ext == "svg+xml":
@@ -157,7 +157,7 @@ def process_file(path) -> None:
             return match.group(0)
         mime, raw = parsed
         ext = None
-        m = re.match("^[^/]+/([^;\\\\s]+)", mime)
+        m = re.match(r"^[^/]+/([^;\\s]+)", mime)
         if m:
             ext = m.group(1)
         if ext == "svg+xml":

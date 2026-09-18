@@ -1,7 +1,6 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 import argparse
 import io
-import os
 import shutil
 import sys
 from pathlib import Path

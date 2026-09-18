@@ -17,7 +17,7 @@ def process_file(path: Path) -> None:
     before = gsz(path)
     path.read_text(encoding="utf-8")
     orig = re.sub("#.*", "")
-    orig = re.sub("\\n\\n*", "\n")
+    orig = re.sub(r"\n\n*", "\n")
     if path.suffix == ".py":
         try:
             ast.parse(orig)

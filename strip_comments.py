@@ -246,7 +246,7 @@ def strip_js(source: str) -> str:
 
 
 _PRESERVE_COMMENT: Final[re.Pattern[str]] = re.compile(
-    "^\\s*#\\s*(type|fmt|noqa|pyright|pylint|mypy|ruff)\\s*[:\\s]"
+    r"^\s*#\s*(type|fmt|noqa|pyright|pylint|mypy|ruff)\s*[:\s]"
 )
 
 
@@ -367,7 +367,7 @@ def strip_lua(source: str) -> str:
     i: int = 0
     n: int = len(source)
     while i < n:
-        ls_m = re.match("\\[(?P<eq>=*)\\[", source[i:])
+        ls_m = re.match(r"\[(?P<eq>=*)\[", source[i:])
         if ls_m and source[i] == "[":
             eq = ls_m.group("eq")
             close = "]" + eq + "]"
@@ -396,7 +396,7 @@ def strip_lua(source: str) -> str:
                     i += 1
             continue
         if source[i : i + 2] == "--":
-            lc_m = re.match("--\\[(?P<eq>=*)\\[", source[i:])
+            lc_m = re.match(r"--\[(?P<eq>=*)\[", source[i:])
             if lc_m:
                 eq = lc_m.group("eq")
                 close = "]" + eq + "]"

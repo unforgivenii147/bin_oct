@@ -7,7 +7,6 @@ Pure-Python ping for Termux.
 
 import argparse
 import os
-import random
 import select
 import socket
 import struct

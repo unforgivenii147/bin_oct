@@ -26,7 +26,7 @@ from collections.abc import Iterable
 from importlib.metadata import distributions
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Final, List, Optional, Set
+from typing import Final, Optional
 
 import tree_sitter_python as tsp
 from loguru import logger

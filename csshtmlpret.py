@@ -133,11 +133,11 @@ def normalize_whitespace(css: str) -> str:
     for line_of_css in css.splitlines():
         css_no_trailing_whitespace += line_of_css.rstrip() + "\n"
     css = css_no_trailing_whitespace
-    css = re.sub("\\n{3}", "\n\n\n", css)
-    css = re.sub("\\n{5}", "\n\n\n\n\n", css)
-    css = re.sub("\\n{6,}", f"\n\n\n/*{'-' * 72}*/\n\n\n", css)
+    css = re.sub(r"\n{3}", "\n\n\n", css)
+    css = re.sub(r"\n{5}", "\n\n\n\n\n", css)
+    css = re.sub(r"\n{6,}", f"\n\n\n/*{'-' * 72}*/\n\n\n", css)
     css = css.replace(" ;\n", ";\n").replace("{\n", " {\n")
-    css = re.sub("\\s{2,}{\\n", " {\n", css)
+    css = re.sub(r"\s{2,}{\n", " {\n", css)
     return css.replace("\t", "    ").rstrip() + "\n"
 
 
@@ -206,7 +206,7 @@ def css_prettify(css: str, justify: bool = False, extraline: bool = False) -> st
 
 if BeautifulSoup:
     orig_prettify = BeautifulSoup.prettify
-    regez = re.compile("^(\\s*)", re.MULTILINE)
+    regez = re.compile(r"^(\s*)", re.MULTILINE)
 
     def prettify(
         self, encoding=None, formatter: str = "minimal", indent_width: int = 4

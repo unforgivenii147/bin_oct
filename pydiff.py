@@ -24,7 +24,7 @@ import sys
 from collections.abc import Iterable, Sequence
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Final, List, Optional, Tuple
+from typing import Final, Optional, Tuple
 
 from loguru import logger
 

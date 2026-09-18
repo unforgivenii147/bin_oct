@@ -130,7 +130,7 @@ class FunctionExtractor:
             return
         lines = content.split("\n")
         function_start_pattern = re.compile(
-            "^\\s*(?:function\\s+)?(\\w[\\w\\-]*)\\s*(?:\\(\\))?\\s*\\{"
+            r"^\s*(?:function\s+)?(\w[\w\-]*)\s*(?:\(\))?\s*\{"
         )
         i = 0
         while i < len(lines):
@@ -169,7 +169,7 @@ class FunctionWriter:
     def write_function(
         self, func_name: str, func_content: str, source_file: Path
     ) -> Path | None:
-        safe_func_name = re.sub("[^\\w\\-]", "_", func_name)
+        safe_func_name = re.sub(r"[^\w\-]", "_", func_name)
         try:
             rel_path = source_file.relative_to(Path.cwd())
         except ValueError:

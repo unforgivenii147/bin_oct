@@ -27,7 +27,7 @@ import sys
 from collections.abc import Iterable
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Final, List, Optional
+from typing import Final, Optional
 
 from deep_translator import GoogleTranslator
 from loguru import logger

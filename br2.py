@@ -2,7 +2,6 @@
 """Compress each non-hidden subdirectory as `<name>.tar.br` and each regular file as `<name>.br` in the current directory: build tar archives in memory, Brotli-compress with quality 11 in chunks of 64 KiB, run both job types through `multiprocessing.pool.starmap` on a fixed pool of 8 workers, and log with loguru."""
 
 import io
-import sys
 import tarfile
 from multiprocessing.pool import Pool
 from pathlib import Path

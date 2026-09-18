@@ -329,14 +329,12 @@ def extract_and_save_gitlinks(urllist) -> None:
     for url in urllist:
         if is_github_url(url):
             glinks.append(url)
-            print(url)
     repoz = extract_git_repos(glinks)
     if repoz:
         repos = "\n".join(repoz)
         append_text(REPO_FILE, repos)
         git_links = "\n".join(glinks)
         append_text(GIT_FILE, git_links)
-        print(f"{len(glinks)} links found.")
     else:
         print("no git link")
 

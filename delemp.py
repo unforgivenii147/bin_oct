@@ -26,7 +26,7 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Final
 
-from binaryornot.check import is_binary
+from dh import is_binary
 from loguru import logger
 
 MMAP_THRESHOLD: int = 1024 * 1024
