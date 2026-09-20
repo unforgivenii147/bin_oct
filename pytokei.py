@@ -86,6 +86,7 @@ DEFAULT_EXCLUDES: list[str] = [".git"]
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+
 def is_binary(path: Path) -> bool:
     """Return True if the file appears to be binary (contains NUL bytes)."""
     try:
@@ -173,8 +174,7 @@ def analyze(root: Path, excludes: set[str]) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "total": {"code": 0, "comments": 0, "blank": 0},
         "languages": {
-            lang: {"code": 0, "comments": 0, "blank": 0}
-            for lang in LANGUAGE_EXTENSIONS
+            lang: {"code": 0, "comments": 0, "blank": 0} for lang in LANGUAGE_EXTENSIONS
         },
     }
 
@@ -220,6 +220,7 @@ def print_report(stats: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""

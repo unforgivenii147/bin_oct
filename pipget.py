@@ -1,77 +1,76 @@
 #!/data/data/com.termux/files/home/.local/bin/python
+"""Download Python packages from a PyPI mirror.
+
+Backend
+-------
+All network I/O goes through ``httpx.AsyncClient`` (async, connection-pooled,
+supports streaming).  Packages are processed concurrently, bounded by an
+``asyncio.Semaphore``.
+
+Strategy
+--------
+For each package we fetch the mirror's package page, parse out the list of
+published files, and pick the "best" candidate according to this priority:
+
+    1. Source distribution (``.tar.gz``, ``.zip``, ``.tar.bz2``, ``.tar.xz``,
+       ``.tgz``) — portable across platforms.
+    2. Pure-Python wheel (``py3-none-any``) — portable across platforms.
+    3. Anything else is treated as an arch-specific binary and *skipped*.
+
+Any file larger than ``MAX_FILE_SIZE`` (10 MiB) is skipped, both as a
+pre-flight check on ``Content-Length`` and as a mid-stream safety net.
+"""
+
 import argparse
+import asyncio
 import re
 import sys
 import time
-from io import BytesIO
 from pathlib import Path
 
-import pycurl
+import httpx
 from bs4 import BeautifulSoup
-from dh import cprint
+from dh import cprint  # kept for parity with the original script
 
-# Mirror configurations
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 MIRRORS = {
     "runflare": "https://mirror-pypi.runflare.com",
-    "pypi": "https://pypi.org/simple",
+    "pypi":     "https://pypi.org/simple",
     "tsinghua": "https://pypi.tuna.tsinghua.edu.cn/simple",
 }
 DEFAULT_MIRROR = "runflare"
 
-TIMEOUT = 30
-DOWNLOAD_DIR = Path.cwd()
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+# Timeouts (seconds).  ``read`` applies per chunk, so long downloads are fine.
+PAGE_TIMEOUT     = 30.0
+DOWNLOAD_TIMEOUT = 120.0
 
-ARCH_TAGS = [
-    "win32",
-    "win_amd64",
-    "win_arm64",
-    "win32",
-    "windows",
-    "manylinux",
-    "musllinux",
-    "linux_i686",
-    "linux_x86_64",
-    "linux_armv7l",
-    "linux_aarch64",
-    "linux_armv6l",
-    "linux_armv8l",
-    "macosx",
-    "darwin",
-    "x86_64",
-    "amd64",
-    "i686",
-    "i386",
-    "aarch64",
-    "armv7l",
-    "armv6l",
-    "armv8l",
-    "ppc64",
-    "ppc64le",
-    "s390x",
-    "riscv64",
-    "cp36",
-    "cp37",
-    "cp38",
-    "cp39",
-    "cp310",
-    "cp311",
-    "cp312",
-    "cp313",
-    "cp27",
-    "cp35",
-    "pp27",
-    "pp36",
-    "pp37",
-    "pp38",
-    "pp39",
-    "pypy",
-    "jython",
-    "32",
-    "64",
-]
+DOWNLOAD_DIR        = Path.cwd()   # Overwritten by -d / --dir
+MAX_RETRIES         = 3
+RETRY_DELAY         = 2            # Base seconds for linear back-off
+DEFAULT_CONCURRENCY = 5
+CHUNK_SIZE          = 65536        # 64 KiB streaming chunks
 
+# --- Size cap -------------------------------------------------------------
+# Skip any file whose total size would exceed this many bytes.  10 MiB is a
+# sensible default for source bundles / pure wheels; bump it via --max-size
+# if you need to grab something bigger.
+MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 MiB
+
+# Extensions considered source distributions (``.zip`` included: many
+# older packages publish their sdist as a ZIP, and the original script
+# silently dropped them).
+SDIST_EXTENSIONS = (
+    ".tar.gz",
+    ".zip",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tgz",
+)
+
+# Matches wheel filenames like  <name>-<pyver>-<abi>-<platform>.whl
 WHEEL_PLATFORM_RE = re.compile(
     r"-(cp\d+|pp\d+|py\d+)"
     r"(-(cp\d+|pp\d+|py\d+))?"
@@ -79,9 +78,54 @@ WHEEL_PLATFORM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Substrings indicating a platform / architecture-specific artifact.
+ARCH_TAGS = [
+    "win32", "win_amd64", "win_arm64", "windows",
+    "manylinux", "musllinux",
+    "linux_i686", "linux_x86_64", "linux_armv7l", "linux_aarch64",
+    "linux_armv6l", "linux_armv8l",
+    "macosx", "darwin",
+    "x86_64", "amd64", "i686", "i386",
+    "aarch64", "armv7l", "armv6l", "armv8l",
+    "ppc64", "ppc64le", "s390x", "riscv64",
+    "cp27", "cp35", "cp36", "cp37", "cp38", "cp39",
+    "cp310", "cp311", "cp312", "cp313",
+    "pp27", "pp36", "pp37", "pp38", "pp39",
+    "pypy", "jython",
+    "32", "64",
+]
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Serialises multi-line output so concurrent tasks don't garble each other.
+_PRINT_LOCK = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class FileTooLarge(Exception):
+    """Raised when a remote file exceeds ``MAX_FILE_SIZE``.
+
+    We use an exception (rather than a boolean return) so the signal
+    bypasses the retry loop — retrying an oversized file is pointless.
+    """
+
+    def __init__(self, size: int):
+        super().__init__(f"file is {size} bytes (limit: {MAX_FILE_SIZE})")
+        self.size = size
+
+
+# ---------------------------------------------------------------------------
+# URL / filename classification (pure, synchronous)
+# ---------------------------------------------------------------------------
 
 def is_windows_url(url: str) -> bool:
-    """Check if URL is a Windows-tagged package."""
+    """Return True if the URL clearly refers to a Windows-only artifact."""
     lower = url.lower()
     return (
         "win32" in lower
@@ -92,98 +136,86 @@ def is_windows_url(url: str) -> bool:
 
 
 def has_arch_tag(url: str) -> bool:
-    """Check if URL has any architecture/platform specific tag."""
+    """Return True if the URL carries any platform / architecture tag."""
     lower = url.lower()
     if WHEEL_PLATFORM_RE.search(lower):
         return True
-    for tag in [
-        "manylinux",
-        "musllinux",
-        "macosx",
-        "darwin",
-        "x86_64",
-        "amd64",
-        "i686",
-        "aarch64",
-        "armv7l",
-        "armv6l",
-        "armv8l",
-        "ppc64",
-        "s390x",
-        "riscv64",
-    ]:
+    for tag in ARCH_TAGS:
         if tag in lower:
             return True
     return False
 
 
 def is_sdist(url: str) -> bool:
-    """Check if URL points to a source distribution (.tar.gz)."""
-    return url.lower().endswith(".tar.gz")
+    """Return True if the URL points to a source distribution archive."""
+    return url.lower().endswith(SDIST_EXTENSIONS)
 
 
 def is_pure_wheel(url: str) -> bool:
-    """Check if URL is a pure Python wheel (py3-none-any)."""
+    """Return True if the URL points to a pure-Python wheel (py3-none-any)."""
     lower = url.lower()
     if not lower.endswith(".whl"):
         return False
     return "py3-none-any" in lower or "py2.py3-none-any" in lower
 
 
-def select_best_url(links: list, pkg_name: str) -> tuple[str, str, str] | None:
+# ---------------------------------------------------------------------------
+# Candidate selection
+# ---------------------------------------------------------------------------
+
+def select_best_url(links: list, pkg_name: str):
+    """Pick the best download URL from a list of ``<a>`` tags.
+
+    Returns ``(url, filename, status)`` where status is one of
+    ``"download"`` / ``"skip"`` / ``None``.
     """
-    Select best download URL from links.
-    Returns (url, filename, status) where status is:
-      - "download" : should be downloaded
-      - "skip"     : has arch tag, should be skipped but URL reported
-      - "error"    : no suitable file found
-    """
-    sdist_candidates = []
-    pure_wheel_candidates = []
-    arch_skipped = []
+    sdist_candidates:      list = []
+    pure_wheel_candidates: list = []
+    arch_skipped:          list = []
 
     for link in links:
         href = link.get("href", "").strip()
         if not href:
             continue
-        url = href.split("#")[0]
+
+        url = href.split("#")[0]                       # drop ``#sha256=…``
         filename = link.get_text().strip() or url.split("/")[-1]
 
         if is_windows_url(url):
             continue
-
         if has_arch_tag(url):
             arch_skipped.append((url, filename))
             continue
-
         if is_sdist(url):
             sdist_candidates.append((url, filename))
-        elif is_pure_wheel(url):
+            continue
+        if is_pure_wheel(url):
             pure_wheel_candidates.append((url, filename))
 
+    # Newest versions are usually last → take the tail.  SDists win.
     if sdist_candidates:
         url, filename = sdist_candidates[-1]
         return (url, filename, "download")
-
     if pure_wheel_candidates:
         url, filename = pure_wheel_candidates[-1]
         return (url, filename, "download")
-
     if arch_skipped:
         url, filename = arch_skipped[-1]
         return (url, filename, "skip")
-
     return None
 
 
+# ---------------------------------------------------------------------------
+# Local filesystem helpers
+# ---------------------------------------------------------------------------
+
 def find_existing_package(pkg_name: str) -> bool:
-    """Check if any file for this package already exists in the download dir."""
+    """Return True if a non-empty file for ``pkg_name`` already exists."""
     normalized = pkg_name.lower().replace("-", "_").replace(".", "_")
     pattern = re.compile(
         r"^" + re.escape(normalized) + r"[-_.]v?\d",
         re.IGNORECASE,
     )
-
     for f in DOWNLOAD_DIR.iterdir():
         if not f.is_file() or f.stat().st_size == 0:
             continue
@@ -193,182 +225,248 @@ def find_existing_package(pkg_name: str) -> bool:
     return False
 
 
-def fetch_package_page(pkg_name: str, mirror_base: str, is_simple_index: bool) -> str:
-    """
-    Fetch the package page from the given mirror.
+# ---------------------------------------------------------------------------
+# Async network layer
+# ---------------------------------------------------------------------------
 
-    - For 'simple index' style mirrors (PyPI, Tsinghua), the URL is
-      {base}/{name}/  and the page contains direct links to files.
-    - For the runflare mirror, the URL is {base}/{name} (no trailing slash).
+async def fetch_package_page(
+    client: httpx.AsyncClient,
+    pkg_name: str,
+    mirror_base: str,
+    is_simple_index: bool,
+) -> str:
+    """Fetch the HTML index page for ``pkg_name``.
+
+    Returns decoded HTML on success, ``""`` on any failure.
     """
     if is_simple_index:
         url = f"{mirror_base.rstrip('/')}/{pkg_name}/"
     else:
         url = f"{mirror_base.rstrip('/')}/{pkg_name}"
 
-    buffer = BytesIO()
-    curl = pycurl.Curl()
-    curl.setopt(curl.URL, url)
-    curl.setopt(curl.WRITEDATA, buffer)
-    curl.setopt(curl.FOLLOWLOCATION, 1)
-    curl.setopt(curl.TIMEOUT, TIMEOUT)
-    curl.setopt(
-        curl.USERAGENT,
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    )
-    curl.setopt(curl.ACCEPT_ENCODING, "gzip, deflate")
-    curl.setopt(
-        curl.HTTPHEADER,
-        [
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language: en-US,en;q=0.5",
-        ],
-    )
     try:
-        curl.perform()
-        response_code = curl.getinfo(curl.RESPONSE_CODE)
-        if response_code != 200:
-            if response_code == 402:
-                print(
-                    "  HTTP 402: Payment Required - The mirror might require authentication"
-                )
-            elif response_code == 403:
-                print("  HTTP 403: Forbidden - Access denied")
-            elif response_code == 404:
-                print(f"  Package '{pkg_name}' not found on mirror")
-            elif response_code == 429:
-                print("  HTTP 429: Too Many Requests - Rate limited")
-            return ""
-        return buffer.getvalue().decode("utf-8", errors="replace")
-    except Exception:
+        r = await client.get(url, timeout=PAGE_TIMEOUT)
+    except httpx.HTTPError as e:
+        print(f"[{pkg_name}]  Network error: {e}")
         return ""
-    finally:
-        curl.close()
+
+    if r.status_code != 200:
+        if r.status_code == 402:
+            print(f"[{pkg_name}]  HTTP 402: Payment Required")
+        elif r.status_code == 403:
+            print(f"[{pkg_name}]  HTTP 403: Forbidden")
+        elif r.status_code == 404:
+            print(f"[{pkg_name}]  Package not found on mirror")
+        elif r.status_code == 429:
+            print(f"[{pkg_name}]  HTTP 429: Rate limited")
+        else:
+            print(f"[{pkg_name}]  HTTP {r.status_code}")
+        return ""
+
+    return r.text
 
 
-def extract_latest_download_url(
-    html: str, pkg_name: str
-) -> tuple[str, str, str] | None:
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        all_links = soup.find_all("a", href=True)
-        if not all_links:
-            return None
-        return select_best_url(all_links, pkg_name)
-    except Exception:
-        return None
-
-
-def download_file_with_retry(
-    url: str, filename: str, max_retries: int = MAX_RETRIES
+async def download_file(
+    client: httpx.AsyncClient,
+    url: str,
+    filename: str,
+    pkg_name: str = "",
+    referer: str = "",
 ) -> bool:
+    """Stream ``url`` into ``DOWNLOAD_DIR/filename``.
+
+    Raises :class:`FileTooLarge` if the file exceeds ``MAX_FILE_SIZE``,
+    either from the ``Content-Length`` header (pre-flight) or from actual
+    bytes received (safety net for chunked responses).  Returns True on
+    HTTP 200 + full download, False on any other failure.
+    """
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DOWNLOAD_DIR / filename
+
+    # Already there and non-empty → nothing to do.
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return True
+
+    print(f"[{pkg_name}]  Downloading: {filename}")
+
+    headers = {"Accept": "*/*", "Accept-Language": "en-US,en;q=0.5"}
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        async with client.stream(
+            "GET", url, headers=headers, timeout=DOWNLOAD_TIMEOUT
+        ) as r:
+            if r.status_code != 200:
+                if r.status_code == 402:
+                    print(f"[{pkg_name}]  HTTP 402: Payment Required")
+                elif r.status_code == 403:
+                    print(f"[{pkg_name}]  HTTP 403: Forbidden")
+                elif r.status_code == 404:
+                    print(f"[{pkg_name}]  HTTP 404: File not found")
+                elif r.status_code == 429:
+                    print(f"[{pkg_name}]  HTTP 429: Rate limited")
+                else:
+                    print(f"[{pkg_name}]  HTTP {r.status_code}")
+                return False
+
+            # ---- Pre-flight size check -------------------------------
+            # ``r.headers`` is already populated; the body hasn't been
+            # consumed yet, so we can bail out with zero bytes read.
+            try:
+                total = int(r.headers.get("content-length", "0") or 0)
+            except ValueError:
+                total = 0
+
+            if total > MAX_FILE_SIZE:
+                # Raising here exits the ``async with`` cleanly — httpx
+                # closes the connection without us pulling the body.
+                raise FileTooLarge(total)
+
+            # ---- Stream the body -------------------------------------
+            downloaded     = 0
+            next_milestone = 25
+
+            with open(output_path, "wb") as f:
+                async for chunk in r.aiter_bytes(chunk_size=CHUNK_SIZE):
+                    downloaded += len(chunk)
+
+                    # Mid-stream safety net: server lied about
+                    # Content-Length, or used chunked encoding with no
+                    # advertised length.  Abort as soon as we exceed
+                    # the cap.
+                    if downloaded > MAX_FILE_SIZE:
+                        raise FileTooLarge(downloaded)
+
+                    f.write(chunk)
+
+                    if total > 0:
+                        pct = downloaded * 100 // total
+                        if pct >= next_milestone:
+                            async with _PRINT_LOCK:
+                                cprint(
+                                    f"[{pkg_name}]  Progress: {pct}% "
+                                    f"({downloaded:,}/{total:,} bytes)"
+                                )
+                            next_milestone = (pct // 25 + 1) * 25
+
+            return True
+
+    except FileTooLarge:
+        # Clean up any partial file, then let the signal propagate to
+        # the caller so it can be tagged as "too_large".
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        raise
+
+    except httpx.HTTPError as e:
+        print(f"[{pkg_name}]  Network error: {e}")
+        if output_path.exists():
+            output_path.unlink()
+        return False
+    except Exception as e:
+        print(f"[{pkg_name}]  Unexpected error: {e}")
+        if output_path.exists():
+            output_path.unlink()
+        return False
+
+
+async def download_file_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    filename: str,
+    pkg_name: str = "",
+    max_retries: int = MAX_RETRIES,
+) -> bool:
+    """Linear-back-off wrapper around :func:`download_file`.
+
+    ``FileTooLarge`` is *not* retried — it propagates straight through.
+    """
     for attempt in range(max_retries):
         if attempt > 0:
-            time.sleep(RETRY_DELAY * attempt)
-        if download_file(url, filename):
+            await asyncio.sleep(RETRY_DELAY * attempt)
+        if await download_file(client, url, filename, pkg_name=pkg_name):
             return True
     return False
 
 
-def download_file(url: str, filename: str, referer: str = "") -> bool:
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = DOWNLOAD_DIR / filename
-    if output_path.exists() and output_path.stat().st_size > 0:
-        return True
-    print(f"  Downloading: {filename}")
-    with open(output_path, "wb") as f:
-        curl = pycurl.Curl()
-        curl.setopt(curl.URL, url)
-        curl.setopt(curl.WRITEDATA, f)
-        curl.setopt(curl.FOLLOWLOCATION, 1)
-        curl.setopt(curl.TIMEOUT, 120)
-        curl.setopt(
-            curl.USERAGENT,
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        curl.setopt(curl.ACCEPT_ENCODING, "gzip, deflate")
-        headers = [
-            "Accept: */*",
-            "Accept-Language: en-US,en;q=0.5",
-        ]
-        if referer:
-            headers.append(f"Referer: {referer}")
-        curl.setopt(curl.HTTPHEADER, headers)
-        curl.setopt(curl.NOPROGRESS, 0)
+async def process_package(
+    client: httpx.AsyncClient,
+    pkg_name: str,
+    mirror_base: str,
+    is_simple_index: bool,
+    semaphore: asyncio.Semaphore,
+) -> tuple:
+    """Fetch, select and download one package under ``semaphore``.
 
-        def progress_callback(download_t, download_d, upload_t, upload_d):
-            if download_t > 0:
-                percent = (download_d * 40) / download_t
-                if int(percent) % 10 == 0:
-                    cprint(
-                        f"  Progress: {percent:.1f}% ({download_d:,}/{download_t:,} bytes)",
-                        end="\r",
-                    )
-            else:
-                cprint(f"  Downloaded: {download_d:,} bytes", end="\r")
-            return 0
-
-        curl.setopt(curl.XFERINFOFUNCTION, progress_callback)
+    Returns ``(pkg_name, status)`` where status ∈
+    ``{"ok", "exists", "skipped", "too_large", "failed"}``.
+    """
+    async with semaphore:
         try:
-            curl.perform()
-            response_code = curl.getinfo(curl.RESPONSE_CODE)
-            if response_code == 200:
-                print()
-                return True
-            else:
-                if response_code == 402:
-                    print(
-                        "  HTTP 402: Payment Required - The mirror might require authentication or has usage limits"
-                    )
-                elif response_code == 403:
-                    print("  HTTP 403: Forbidden - Access denied")
-                elif response_code == 404:
-                    print("  HTTP 404: File not found on mirror")
-                elif response_code == 429:
-                    print(
-                        "  HTTP 429: Too Many Requests - Rate limited, try again later"
-                    )
-                if output_path.exists():
-                    output_path.unlink()
-                return False
-        except Exception:
-            return False
-        finally:
-            curl.close()
+            if find_existing_package(pkg_name):
+                print(f"[{pkg_name}]  Already exists, skipping")
+                return (pkg_name, "exists")
+
+            html = await fetch_package_page(
+                client, pkg_name, mirror_base, is_simple_index
+            )
+            if not html:
+                return (pkg_name, "failed")
+
+            info = None
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                links = soup.find_all("a", href=True)
+                if links:
+                    info = select_best_url(links, pkg_name)
+            except Exception as e:
+                print(f"[{pkg_name}]  Parse error: {e}")
+                return (pkg_name, "failed")
+
+            if not info:
+                print(f"[{pkg_name}]  No suitable file found on mirror")
+                return (pkg_name, "failed")
+
+            url, filename, status = info
+
+            if status == "skip":
+                print(f"[{pkg_name}]  Skipped (arch-specific only): {filename}")
+                return (pkg_name, "skipped")
+
+            print(f"[{pkg_name}]  URL: {url}")
+
+            try:
+                ok = await download_file_with_retry(
+                    client, url, filename, pkg_name=pkg_name
+                )
+                return (pkg_name, "ok" if ok else "failed")
+
+            except FileTooLarge as e:
+                # Report the actual size we saw (Content-Length or
+                # bytes-received-so-far) plus the configured limit.
+                size_mib = e.size / (1024 * 1024)
+                cap_mib  = MAX_FILE_SIZE / (1024 * 1024)
+                print(
+                    f"[{pkg_name}]  Skipped (size {size_mib:.2f} MiB "
+                    f"> {cap_mib:.2f} MiB limit)"
+                )
+                return (pkg_name, "too_large")
+
+        except Exception as e:
+            print(f"[{pkg_name}]  Error: {e}")
+            return (pkg_name, "failed")
 
 
-def process_package(
-    pkg_name: str, mirror_base: str, is_simple_index: bool
-) -> tuple[bool, bool]:
-    """
-    Returns (success, skipped).
-    - success: True if downloaded successfully OR skipped (counts as OK)
-    - skipped: True if file had arch tag and was not downloaded
-    """
-    html = fetch_package_page(pkg_name, mirror_base, is_simple_index)
-    if not html:
-        return (False, False)
-    download_info = extract_latest_download_url(html, pkg_name)
-    if not download_info:
-        return (False, False)
+# ---------------------------------------------------------------------------
+# Input helpers
+# ---------------------------------------------------------------------------
 
-    url, filename, status = download_info
-
-    if status == "skip":
-        return (True, True)
-
-    print(f"Download URL: {url}")
-    ok = download_file_with_retry(url, filename)
-    return (ok, False)
-
-
-def load_packages_from_file(file_path: str) -> list[str]:
-    """
-    Load package names from a file (one per line).
-    - Ignores empty lines and comments (lines starting with #).
-    - Strips inline comments (everything after #).
-    - Strips version specifiers, keeping only the package name.
-    """
+def load_packages_from_file(file_path: str) -> list:
+    """Read package names from a text file (one per line, ``#`` comments)."""
     path = Path(file_path)
     if not path.is_file():
         print(f"Error: file not found: {file_path}", file=sys.stderr)
@@ -391,58 +489,15 @@ def load_packages_from_file(file_path: str) -> list[str]:
     return packages
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog="pypi-mirror-dl",
-        description="Download packages from a PyPI mirror (source distributions "
-        "and pure-Python wheels preferred; arch-specific wheels skipped).",
-        epilog="Mirror selection: default is runflare. Use -p for official PyPI, "
-        "-c for Tsinghua (China). -p and -c are mutually exclusive.",
-    )
-    parser.add_argument(
-        "packages",
-        nargs="*",
-        help="Package name(s) to download.",
-    )
-    parser.add_argument(
-        "-f",
-        "--file",
-        dest="file",
-        metavar="FILE",
-        help="Read package names from FILE (one per line; blank lines and "
-        "'#' comments are ignored).",
-    )
-    parser.add_argument(
-        "-d",
-        "--dir",
-        dest="directory",
-        metavar="DIR",
-        help="Download directory (default: current directory).",
-    )
+# ---------------------------------------------------------------------------
+# Async driver
+# ---------------------------------------------------------------------------
 
-    mirror_group = parser.add_mutually_exclusive_group()
-    mirror_group.add_argument(
-        "-p",
-        "--pypi",
-        action="store_true",
-        help="Download from official PyPI (https://pypi.org/simple).",
-    )
-    mirror_group.add_argument(
-        "-c",
-        "--china",
-        action="store_true",
-        help="Download from Tsinghua PyPI mirror (China).",
-    )
-    mirror_group.add_argument(
-        "-m",
-        "--mirror",
-        choices=list(MIRRORS.keys()),
-        help="Explicitly choose a mirror by name (default: runflare).",
-    )
+async def run(args) -> int:
+    """Top-level async runner.  Returns the process exit code."""
+    global DOWNLOAD_DIR, MAX_FILE_SIZE
 
-    args = parser.parse_args()
-
-    # Resolve mirror
+    # ---- resolve mirror --------------------------------------------------
     if args.pypi:
         mirror_key = "pypi"
     elif args.china:
@@ -453,11 +508,9 @@ def main():
         mirror_key = DEFAULT_MIRROR
 
     mirror_base = MIRRORS[mirror_key]
-    # PyPI and Tsinghua serve the PEP 503 "simple index" (with trailing slash)
     is_simple_index = mirror_key in ("pypi", "tsinghua")
 
-    # Optionally change download dir
-    global DOWNLOAD_DIR
+    # ---- resolve download directory --------------------------------------
     if args.directory:
         DOWNLOAD_DIR = Path(args.directory).expanduser().resolve()
         if not DOWNLOAD_DIR.is_dir():
@@ -465,9 +518,13 @@ def main():
                 f"Error: download directory does not exist: {DOWNLOAD_DIR}",
                 file=sys.stderr,
             )
-            sys.exit(1)
+            return 1
 
-    # Collect packages from CLI args and file
+    # ---- apply optional size-cap override -------------------------------
+    if args.max_size is not None:
+        MAX_FILE_SIZE = int(args.max_size * 1024 * 1024)
+
+    # ---- collect packages ------------------------------------------------
     packages = list(args.packages)
     if args.file:
         file_pkgs = load_packages_from_file(args.file)
@@ -475,76 +532,168 @@ def main():
         packages.extend(file_pkgs)
 
     if not packages:
-        parser.print_help()
-        sys.exit(1)
+        return 2
 
-    # Deduplicate while preserving order
-    seen = set()
-    unique_packages = []
+    # Deduplicate case-insensitively while preserving order.
+    seen, unique = set(), []
     for p in packages:
         key = p.lower()
         if key not in seen:
             seen.add(key)
-            unique_packages.append(p)
-    packages = unique_packages
+            unique.append(p)
+    packages = unique
 
-    print(f"Mirror: {mirror_key} ({mirror_base})")
-    print(f"Download dir: {DOWNLOAD_DIR}")
+    concurrency = max(1, args.jobs)
+    print(f"Mirror:        {mirror_key} ({mirror_base})")
+    print(f"Download dir:  {DOWNLOAD_DIR}")
+    print(f"Concurrency:   {concurrency}")
+    print(f"Size limit:    {MAX_FILE_SIZE / (1024 * 1024):.2f} MiB")
     print(f"Processing {len(packages)} package(s)...\n")
 
     start_time = time.time()
-    successful = []
-    failed = []
-    skipped = []
-    already_exists = []
 
-    for pkg_name in packages:
-        print(f"[{pkg_name}]")
-        try:
-            if find_existing_package(pkg_name):
-                print(f"  Already exists, skipping")
-                already_exists.append(pkg_name)
-                continue
-            ok, was_skipped = process_package(pkg_name, mirror_base, is_simple_index)
-            if was_skipped:
-                skipped.append(pkg_name)
-            elif ok:
-                successful.append(pkg_name)
-            else:
-                failed.append(pkg_name)
-        except Exception as e:
-            print(f"  Error: {e}")
-            failed.append(pkg_name)
+    timeout = httpx.Timeout(
+        connect=PAGE_TIMEOUT,
+        read=DOWNLOAD_TIMEOUT,
+        write=DOWNLOAD_TIMEOUT,
+        pool=PAGE_TIMEOUT,
+    )
+    limits = httpx.Limits(
+        max_connections=concurrency + 2,
+        max_keepalive_connections=concurrency,
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip, deflate",
+        },
+        limits=limits,
+    ) as client:
+        tasks = [
+            process_package(client, pkg, mirror_base, is_simple_index, semaphore)
+            for pkg in packages
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
     elapsed = time.time() - start_time
 
-    if successful:
-        print(f"\nSuccessfully downloaded:")
-        for pkg in successful:
+    # ---- summarise -------------------------------------------------------
+    buckets = {"ok": [], "exists": [], "skipped": [], "too_large": [], "failed": []}
+    for pkg, status in results:
+        buckets.setdefault(status, []).append(pkg)
+
+    if buckets["ok"]:
+        print("\nSuccessfully downloaded:")
+        for pkg in buckets["ok"]:
             print(f"  ✓ {pkg}")
-    if already_exists:
-        print(f"\nAlready present:")
-        for pkg in already_exists:
+    if buckets["exists"]:
+        print("\nAlready present:")
+        for pkg in buckets["exists"]:
             print(f"  • {pkg}")
-    if skipped:
-        print(f"\nSkipped (arch-specific, no pure source/wheel available):")
-        for pkg in skipped:
+    if buckets["skipped"]:
+        print("\nSkipped (arch-specific, no pure source/wheel available):")
+        for pkg in buckets["skipped"]:
             print(f"  ⚠ {pkg}")
-    if failed:
-        print(f"\nFailed to download:")
-        for pkg in failed:
+    if buckets["too_large"]:
+        print(f"\nSkipped (over {MAX_FILE_SIZE / (1024 * 1024):.2f} MiB):")
+        for pkg in buckets["too_large"]:
+            print(f"  ⚠ {pkg}")
+    if buckets["failed"]:
+        print("\nFailed to download:")
+        for pkg in buckets["failed"]:
             print(f"  ✗ {pkg}")
 
     print(
         f"\nDone in {elapsed:.1f}s — "
-        f"{len(successful)} downloaded, "
-        f"{len(already_exists)} already present, "
-        f"{len(skipped)} skipped, "
-        f"{len(failed)} failed"
+        f"{len(buckets['ok'])} downloaded, "
+        f"{len(buckets['exists'])} already present, "
+        f"{len(buckets['skipped'])} skipped (arch), "
+        f"{len(buckets['too_large'])} skipped (size), "
+        f"{len(buckets['failed'])} failed"
     )
 
-    if failed:
+    return 1 if buckets["failed"] else 0
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pypi-mirror-dl",
+        description=(
+            "Download packages from a PyPI mirror (source distributions "
+            "and pure-Python wheels preferred; arch-specific wheels and "
+            "files larger than the size cap are skipped)."
+        ),
+        epilog=(
+            "Mirror selection: default is runflare. Use -p for official "
+            "PyPI, -c for Tsinghua (China). -p/-c/-m are mutually exclusive."
+        ),
+    )
+    parser.add_argument(
+        "packages", nargs="*", help="Package name(s) to download."
+    )
+    parser.add_argument(
+        "-f", "--file", dest="file", metavar="FILE",
+        help=(
+            "Read package names from FILE (one per line; blank lines and "
+            "'#' comments are ignored)."
+        ),
+    )
+    parser.add_argument(
+        "-d", "--dir", dest="directory", metavar="DIR",
+        help="Download directory (default: current directory).",
+    )
+    parser.add_argument(
+        "-j", "--jobs", dest="jobs", type=int, default=DEFAULT_CONCURRENCY,
+        metavar="N",
+        help=f"Concurrent downloads (default: {DEFAULT_CONCURRENCY}).",
+    )
+    parser.add_argument(
+        "--max-size", dest="max_size", type=float, default=None,
+        metavar="MiB",
+        help=(
+            f"Skip files larger than this (in MiB). "
+            f"Default: {MAX_FILE_SIZE // (1024 * 1024)}."
+        ),
+    )
+
+    mirror_group = parser.add_mutually_exclusive_group()
+    mirror_group.add_argument(
+        "-p", "--pypi", action="store_true",
+        help="Download from official PyPI.",
+    )
+    mirror_group.add_argument(
+        "-c", "--china", action="store_true",
+        help="Download from Tsinghua PyPI mirror.",
+    )
+    mirror_group.add_argument(
+        "-m", "--mirror", choices=list(MIRRORS.keys()),
+        help="Explicitly choose a mirror by name.",
+    )
+
+    args = parser.parse_args()
+
+    if not args.packages and not args.file:
+        parser.print_help()
         sys.exit(1)
+
+    try:
+        exit_code = asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(130)
+
+    if exit_code == 2:
+        parser.print_help()
+        sys.exit(1)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

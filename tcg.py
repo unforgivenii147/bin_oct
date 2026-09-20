@@ -18,7 +18,7 @@ EXTENSION_MAP = {
     ".bash": "bash",
     ".rs": "rust",
 }
-SCRIPT_EXTENSIONS = {".py", ".sh", ".rs"}   # <-- only these get symlink/executable
+SCRIPT_EXTENSIONS = {".py", ".sh", ".rs"}  # <-- only these get symlink/executable
 SCRIPT_DIRS = {
     Path.home() / "bin",
     Path.home() / "bashbin",
@@ -101,9 +101,8 @@ def main() -> None:
     output_path = Path(filename)
     # Only treat as a script directory if the extension is one of the script types
     is_script_dir = (
-        (Path.cwd() in SCRIPT_DIRS or Path.cwd().name == "bin")
-        and output_path.suffix.lower() in SCRIPT_EXTENSIONS
-    )
+        Path.cwd() in SCRIPT_DIRS or Path.cwd().name == "bin"
+    ) and output_path.suffix.lower() in SCRIPT_EXTENSIONS
     if archive and output_path.exists():
         archive_existing_file(output_path)
     content = get_clipboard_content()

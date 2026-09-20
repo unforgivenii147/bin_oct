@@ -1,12 +1,9 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
-
 import os
 import sys
 from pathlib import Path
-
 import libcst as cst
-from dh import get_files, mpf
+from dh import get_files, mpf_async
 from libcst import EmptyLine, Pass, SimpleStatementLine
 from libcst.metadata import MetadataWrapper, PositionProvider
 
@@ -14,12 +11,12 @@ from libcst.metadata import MetadataWrapper, PositionProvider
 class StripTransformer(cst.CSTTransformer):
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.comments_removed = 0
         self.docstrings_removed = 0
 
     @staticmethod
-    def _is_docstring_statement(stmt: cst.BaseStatement) -> bool:
+    def _is_docstring_statement(stmt):
         if not isinstance(stmt, cst.SimpleStatementLine):
             return False
         if len(stmt.body) != 1:
@@ -30,15 +27,15 @@ class StripTransformer(cst.CSTTransformer):
         return isinstance(expr.value, cst.SimpleString)
 
     @staticmethod
-    def _is_preserved_comment(value: str) -> bool:
+    def _is_preserved_comment(value):
         stripped = value.lstrip()
         return stripped.startswith(("#!", "# fmt", "# type"))
 
     def leave_Comment(
         self,
-        original_node: cst.Comment,
-        updated_node: cst.Comment,
-    ) -> cst.Comment | cst.RemovalSentinel:
+        original_node,
+        updated_node,
+    ):
         if self._is_preserved_comment(original_node.value):
             return updated_node
         self.comments_removed += 1
@@ -46,9 +43,9 @@ class StripTransformer(cst.CSTTransformer):
 
     def leave_EmptyLine(
         self,
-        original_node: EmptyLine,
-        updated_node: EmptyLine,
-    ) -> EmptyLine:
+        original_node,
+        updated_node,
+    ):
         if updated_node.comment is None:
             return updated_node
         comment = updated_node.comment
@@ -59,9 +56,9 @@ class StripTransformer(cst.CSTTransformer):
 
     def leave_Module(
         self,
-        original_node: cst.Module,
-        updated_node: cst.Module,
-    ) -> cst.Module:
+        original_node,
+        updated_node,
+    ):
         body = list(updated_node.body)
         start = 1 if body and self._is_docstring_statement(body[0]) else 0
         new_body = body[:start]
@@ -74,8 +71,8 @@ class StripTransformer(cst.CSTTransformer):
 
     def _strip_suite(
         self,
-        body: tuple[cst.BaseStatement, ...],
-    ) -> tuple[cst.BaseStatement, ...]:
+        body,
+    ):
         statements = list(body)
         if statements and self._is_docstring_statement(statements[0]):
             self.docstrings_removed += 1
@@ -86,9 +83,9 @@ class StripTransformer(cst.CSTTransformer):
 
     def leave_FunctionDef(
         self,
-        original_node: cst.FunctionDef,
-        updated_node: cst.FunctionDef,
-    ) -> cst.FunctionDef:
+        original_node,
+        updated_node,
+    ):
         body = updated_node.body
         if isinstance(body, cst.IndentedBlock):
             return updated_node.with_changes(
@@ -100,9 +97,9 @@ class StripTransformer(cst.CSTTransformer):
 
     def leave_ClassDef(
         self,
-        original_node: cst.ClassDef,
-        updated_node: cst.ClassDef,
-    ) -> cst.ClassDef:
+        original_node,
+        updated_node,
+    ):
         body = updated_node.body
         if isinstance(body, cst.IndentedBlock):
             return updated_node.with_changes(
@@ -111,7 +108,7 @@ class StripTransformer(cst.CSTTransformer):
         return updated_node
 
 
-def process_file(path: Path) -> None:
+def process_file(path):
     path = Path(path)
     source = path.read_text(encoding="utf-8")
     ROOT = path.parent
@@ -144,14 +141,14 @@ def process_file(path: Path) -> None:
         print(f"{rel}: 0/{transformer.docstrings_removed}")
 
 
-def main() -> None:
+def main():
     cwd = Path.cwd()
     args = sys.argv[1:]
     files = [Path(p) for p in args] if args else get_files(cwd, ext=[".py"])
     if len(files) == 1:
         process_file(files[0])
         sys.exit(0)
-    mpf(process_file, files)
+    mpf_async(process_file, files)
 
 
 if __name__ == "__main__":

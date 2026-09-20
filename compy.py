@@ -28,7 +28,7 @@ from collections import defaultdict
 from io import StringIO
 from pathlib import Path
 from typing import Any
-
+from dh import append_text, runcmd
 
 OUTPUT_FILE = Path("compressed.txt")
 WORKERS = 8
@@ -283,11 +283,7 @@ class ImportCleaner(ast.NodeTransformer):
         return node
 
     def visit_Import(self, node: ast.Import) -> ast.AST | None:
-        kept = [
-            alias
-            for alias in node.names
-            if not is_stdlib_import(alias.name)
-        ]
+        kept = [alias for alias in node.names if not is_stdlib_import(alias.name)]
 
         if not kept:
             return None
@@ -597,9 +593,17 @@ class Simplifier(ast.NodeTransformer):
             value = eval(compiled, {"__builtins__": {}}, {})
             folded = ast.Constant(value=value)
             after = ast.unparse(folded)
-#        except:
-#            return node
-        except (ArithmeticError, MemoryError, OverflowError, SyntaxError, TypeError, ValueError, NameError):
+        #        except:
+        #            return node
+        except (
+            ArithmeticError,
+            MemoryError,
+            OverflowError,
+            SyntaxError,
+            TypeError,
+            ValueError,
+            NameError,
+        ):
             return node
 
         if len(after) < len(before):
@@ -1031,9 +1035,7 @@ def format_output(results: list[tuple[str, str, str | None]]) -> str:
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Compress Python files for LLM input."
-    )
+    parser = argparse.ArgumentParser(description="Compress Python files for LLM input.")
     parser.add_argument(
         "inputs",
         nargs="*",
@@ -1076,7 +1078,13 @@ def main() -> int:
         output += "\n"
 
     OUTPUT_FILE.write_text(output, encoding="utf-8")
-    print(f"Wrote compressed output to {OUTPUT_FILE}")
+    prompt_path = Path.home() / "prompt.txt"
+    prompt_content = prompt_path.read_text(encoding="utf-8")
+    append_text(OUTPUT_FILE, prompt_content)
+    content = OUTPUT_FILE.read_text(encoding="utf-8")
+    cmd = ["termux_clipboard_set", content]
+    runcmd(cmd, show_output=True)
+    print(f"Wrote to {OUTPUT_FILE}")
 
     return 0
 

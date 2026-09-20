@@ -57,6 +57,7 @@ from typing import Any, Iterable, Optional, Sequence
 # Shared helpers
 # ============================================================================
 
+
 def die(msg: str, code: int = 1) -> "None":
     """Print an error and exit."""
     print(f"Error: {msg}", file=sys.stderr)
@@ -225,6 +226,7 @@ def inline_css(mode: str) -> str:
 # Subcommand: svg  (cairosvg2pdf.py)
 # ============================================================================
 
+
 def cmd_svg(args: argparse.Namespace) -> int:
     """Convert an SVG file to PDF via cairosvg."""
     inp = require_input(args.input, check_suffix=".svg")
@@ -256,9 +258,7 @@ class _CHMHtmlExtractor(HTMLParser):
         self.current_skip_tag: Optional[str] = None
 
     def _attrs(self, attrs: Sequence[tuple[str, Optional[str]]]) -> str:
-        return "".join(
-            f' {k}="{v}"' for k, v in attrs if k not in ("href", "src")
-        )
+        return "".join(f' {k}="{v}"' for k, v in attrs if k not in ("href", "src"))
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
         if tag in self.SKIP_TAGS:
@@ -289,7 +289,7 @@ class _CHMHtmlExtractor(HTMLParser):
 
 
 _CHM_STYLE_HEADER = (
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    '<!DOCTYPE html><html><head><meta charset="utf-8">'
     "<style>"
     "body { font-family:Arial,sans-serif; line-height:1.6; margin:2em; }"
     "img { max-width:100%; }"
@@ -304,10 +304,8 @@ def _clean_topic_html(raw: str) -> str:
     """Strip <script>/<style> and reduce blank lines (chm2pdf.py)."""
     if not raw:
         return ""
-    raw = re.sub(r"<script[^>]*>.*?</script>", "", raw,
-                 flags=re.DOTALL | re.IGNORECASE)
-    raw = re.sub(r"<style[^>]*>.*?</style>", "", raw,
-                 flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL | re.IGNORECASE)
     ext = _CHMHtmlExtractor()
     try:
         ext.feed(raw)
@@ -363,9 +361,7 @@ def _chm_weasyprint_extract(chm_path: Path) -> str:
                             parts.append(body)
                     except Exception as exc:  # noqa: BLE001
                         warn(f"could not extract topic {local}: {exc}")
-                    parts.append(
-                        '<hr style="border:1px solid #ccc; margin:20px 0;">'
-                    )
+                    parts.append('<hr style="border:1px solid #ccc; margin:20px 0;">')
             if hasattr(node, "GetChildren"):
                 for child in node.GetChildren():
                     walk(child, depth + 1)
@@ -402,9 +398,7 @@ def _render_multiple_topics(cf: Any, topics: Iterable[str]) -> str:
             body = _clean_topic_html(raw)
             if body:
                 parts.append(body)
-                parts.append(
-                    '<hr style="border:1px solid #ccc; margin:20px 0;">'
-                )
+                parts.append('<hr style="border:1px solid #ccc; margin:20px 0;">')
         except Exception as exc:  # noqa: BLE001
             warn(f"could not extract topic {t}: {exc}")
     parts.append("</body></html>")
@@ -413,6 +407,7 @@ def _render_multiple_topics(cf: Any, topics: Iterable[str]) -> str:
 
 def _escape(s: str) -> str:
     from html import escape
+
     return escape(s)
 
 
@@ -424,10 +419,8 @@ def _strip_html_to_text(raw_html: str) -> str:
     if not raw_html:
         return ""
     s = raw_html
-    s = re.sub(r"<script[^>]*>.*?</script>", "", s,
-               flags=re.DOTALL | re.IGNORECASE)
-    s = re.sub(r"<style[^>]*>.*?</style>", "", s,
-               flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<script[^>]*>.*?</script>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<style[^>]*>.*?</style>", "", s, flags=re.DOTALL | re.IGNORECASE)
     s = s.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     s = s.replace("</p>", "\n\n").replace("<p>", "")
     for lvl in ("h1", "h2", "h3", "h4"):
@@ -435,8 +428,13 @@ def _strip_html_to_text(raw_html: str) -> str:
     s = s.replace("</li>", "\n").replace("<li>", "• ")
     s = s.replace("</div>", "\n").replace("<div>", "")
     s = s.replace("</span>", "").replace("<span>", "")
-    s = (s.replace("&nbsp;", " ").replace("&amp;", "&")
-           .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
+    s = (
+        s.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+    )
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"\n\s*\n", "\n\n", s)
     return s.strip()
@@ -456,11 +454,15 @@ def _chm_reportlab_convert(chm_path: Path, output: Path) -> None:
         from reportlab.lib.enums import TA_CENTER  # type: ignore
         from reportlab.lib.pagesizes import letter  # type: ignore
         from reportlab.lib.styles import (  # type: ignore
-            ParagraphStyle, getSampleStyleSheet,
+            ParagraphStyle,
+            getSampleStyleSheet,
         )
         from reportlab.lib.units import inch  # type: ignore
         from reportlab.platypus import (  # type: ignore
-            PageBreak, Paragraph, SimpleDocTemplate, Spacer,
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
         )
     except ImportError:
         die("reportlab is required for --backend reportlab")
@@ -477,8 +479,7 @@ def _chm_reportlab_convert(chm_path: Path, output: Path) -> None:
     if not topics and hasattr(chm_obj, "list"):
         try:
             topics = [
-                f for f in chm_obj.list()
-                if str(f).lower().endswith((".html", ".htm"))
+                f for f in chm_obj.list() if str(f).lower().endswith((".html", ".htm"))
             ]
         except Exception as exc:  # noqa: BLE001
             warn(f"list failed: {exc}")
@@ -487,8 +488,12 @@ def _chm_reportlab_convert(chm_path: Path, output: Path) -> None:
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "CHMTitle", parent=styles["Heading1"],
-        fontSize=24, textColor="darkblue", alignment=TA_CENTER, spaceAfter=30,
+        "CHMTitle",
+        parent=styles["Heading1"],
+        fontSize=24,
+        textColor="darkblue",
+        alignment=TA_CENTER,
+        spaceAfter=30,
     )
     story: list[Any] = [
         Paragraph(f"<b>{chm_path.stem}</b>", title_style),
@@ -531,8 +536,12 @@ def _chm_reportlab_convert(chm_path: Path, output: Path) -> None:
     if processed == 0:
         die("no content could be extracted from the CHM file")
     doc = SimpleDocTemplate(
-        str(output), pagesize=letter,
-        rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72,
+        str(output),
+        pagesize=letter,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72,
     )
     doc.build(story)
     info(f"PDF created: {output}")
@@ -572,7 +581,7 @@ def cmd_chm(args: argparse.Namespace) -> int:
 
     # Wrap with the same print-style CSS the original used.
     wrapped = (
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
         "<style>\n"
         "@page { size: A4; margin: 2cm; "
         "@bottom-center { content: counter(page); font-size:10px; } }\n"
@@ -610,6 +619,7 @@ def cmd_chm(args: argparse.Namespace) -> int:
 # Subcommand: html  (html2pdf.py)
 # ============================================================================
 
+
 def cmd_html(args: argparse.Namespace) -> int:
     """Convert an HTML file to PDF via WeasyPrint."""
     inp = require_input(args.input)
@@ -618,7 +628,8 @@ def cmd_html(args: argparse.Namespace) -> int:
     css_files: list[str] = list(args.css)
     try:
         render_pdf_from_html(
-            html_text, out,
+            html_text,
+            out,
             css_files=css_files,
             base_url=str(inp.parent),
         )
@@ -634,14 +645,16 @@ def cmd_html(args: argparse.Namespace) -> int:
 
 _MARKDOWN2_SIMPLE_EXTRAS = ["cuddled-lists", "tables"]
 _MARKDOWN2_FULL_EXTRAS = [
-    "header-ids", "fenced-code-blocks", "tables", "cuddled-lists",
+    "header-ids",
+    "fenced-code-blocks",
+    "tables",
+    "cuddled-lists",
 ]
 _PYGMENTS_RE = re.compile(
-    r'<pre><code class="language-(\w+)">(.*?)</code></pre>', re.DOTALL,
+    r'<pre><code class="language-(\w+)">(.*?)</code></pre>',
+    re.DOTALL,
 )
-_TOC_NAV = (
-    '\n<nav class="toc">\n<h1>Contents</h1>\n<ul></ul>\n</nav>\n'
-)
+_TOC_NAV = '\n<nav class="toc">\n<h1>Contents</h1>\n<ul></ul>\n</nav>\n'
 
 
 def _convert_markdown2(
@@ -671,8 +684,7 @@ def _convert_markdown2(
 
         def repl(m: re.Match[str]) -> str:
             lang, code = m.group(1), m.group(2)
-            code = (code.replace("&lt;", "<").replace("&gt;", ">")
-                        .replace("&amp;", "&"))
+            code = code.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
             try:
                 lexer = get_lexer_by_name(lang)
             except Exception:  # noqa: BLE001
@@ -697,7 +709,7 @@ def _convert_markdown(text: str) -> str:
 
 def _wrap_md_html(body_html: str, title: str) -> str:
     return (
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
         f"<title>{_escape(title)}</title>\n</head>\n<body>\n"
         f"{body_html}\n</body>\n</html>"
     )
@@ -735,7 +747,8 @@ def cmd_markdown(args: argparse.Namespace) -> int:
     html_text = _wrap_md_html(body_html, inp.stem)
     try:
         render_pdf_from_html(
-            html_text, out,
+            html_text,
+            out,
             css_files=css_files,
             css_strings=css_strings,
             base_url=str(inp.parent),
@@ -767,9 +780,9 @@ def _format_dictionary_entry(line: str) -> Optional[str]:
     definition = definition.replace("</x>", "</span>")
     definition = _DICT_M_RX.sub("", definition)
     return (
-        "\n<html>\n<body>\n<div class=\"entry\">\n"
-        f"<h1 class=\"word\">{_escape(word)}</h1>\n"
-        f"<div class=\"definition\">{definition}</div>\n"
+        '\n<html>\n<body>\n<div class="entry">\n'
+        f'<h1 class="word">{_escape(word)}</h1>\n'
+        f'<div class="definition">{definition}</div>\n'
         "</div>\n</body>\n</html>\n"
     )
 
@@ -801,12 +814,14 @@ def cmd_dict(args: argparse.Namespace) -> int:
         "</style>"
     )
     html_text = (
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
         f"{css}\n</head>\n<body>\n{''.join(entries)}\n</body></html>"
     )
     try:
         render_pdf_from_html(
-            html_text, out, base_url=str(inp.parent),
+            html_text,
+            out,
+            base_url=str(inp.parent),
         )
     except Exception as exc:  # noqa: BLE001
         die(f"WeasyPrint failed: {exc}")
@@ -826,7 +841,9 @@ _PRECISE_FONTS = [
 ]
 
 
-def _font_face(font_dir: Path, family: str, style: str, weight: int, filename: str) -> str:
+def _font_face(
+    font_dir: Path, family: str, style: str, weight: int, filename: str
+) -> str:
     p = font_dir / filename
     if not p.exists():
         warn(f"'{filename}' not found in {font_dir} — skipping")
@@ -932,6 +949,7 @@ def cmd_compile_css(args: argparse.Namespace) -> int:
 # CLI
 # ============================================================================
 
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argparse CLI."""
     p = argparse.ArgumentParser(
@@ -952,7 +970,9 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("chm", help="CHM -> PDF.")
     b.add_argument("input", help="Input .chm file.")
     b.add_argument(
-        "-b", "--backend", choices=("weasyprint", "reportlab"),
+        "-b",
+        "--backend",
+        choices=("weasyprint", "reportlab"),
         default="weasyprint",
         help="Rendering backend (default: weasyprint).",
     )
@@ -962,8 +982,9 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- html -------------------------------------------------------------
     c = sub.add_parser("html", help="HTML -> PDF (WeasyPrint).")
     c.add_argument("input", help="Input .html file.")
-    c.add_argument("--css", action="append", default=[],
-                   help="Extra CSS file (repeatable).")
+    c.add_argument(
+        "--css", action="append", default=[], help="Extra CSS file (repeatable)."
+    )
     c.add_argument("-o", "--output", help="Output PDF (default: <stem>.pdf).")
     c.set_defaults(func=cmd_html)
 
@@ -971,42 +992,60 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("md", help="Markdown -> PDF.")
     d.add_argument("input", help="Input .md file.")
     d.add_argument(
-        "--converter", choices=("markdown2", "markdown"),
+        "--converter",
+        choices=("markdown2", "markdown"),
         default="markdown2",
         help="Markdown library (default: markdown2, matches md2pdf.py).",
     )
-    d.add_argument("--css", action="append", default=[],
-                   help="Extra CSS file (repeatable).")
-    d.add_argument("--pygments", action="store_true",
-                   help="Highlight fenced code blocks with Pygments "
-                        "(markdown2 converter only).")
-    d.add_argument("--toc", action="store_true",
-                   help="Prepend a TOC nav block (markdown2 converter only).")
     d.add_argument(
-        "--inline-css", choices=("none", "default", "local-fonts"),
+        "--css", action="append", default=[], help="Extra CSS file (repeatable)."
+    )
+    d.add_argument(
+        "--pygments",
+        action="store_true",
+        help="Highlight fenced code blocks with Pygments (markdown2 converter only).",
+    )
+    d.add_argument(
+        "--toc",
+        action="store_true",
+        help="Prepend a TOC nav block (markdown2 converter only).",
+    )
+    d.add_argument(
+        "--inline-css",
+        choices=("none", "default", "local-fonts"),
         default="none",
-        help="Embed one of the pre-baked inline stylesheets "
-             "(default: none).",
+        help="Embed one of the pre-baked inline stylesheets (default: none).",
     )
     d.add_argument("-o", "--output", help="Output PDF (default: <stem>.pdf).")
     d.set_defaults(func=cmd_markdown)
 
     # ---- dict -------------------------------------------------------------
     e = sub.add_parser("dict", help="Dictionary .txt -> PDF (WeasyPrint).")
-    e.add_argument("input", nargs="?", default="dictionary.txt",
-                   help="Input tab-separated dictionary file.")
-    e.add_argument("--font", default="custom.ttf",
-                   help="Font file to embed (default: custom.ttf).")
+    e.add_argument(
+        "input",
+        nargs="?",
+        default="dictionary.txt",
+        help="Input tab-separated dictionary file.",
+    )
+    e.add_argument(
+        "--font", default="custom.ttf", help="Font file to embed (default: custom.ttf)."
+    )
     e.add_argument("-o", "--output", help="Output PDF (default: <stem>.pdf).")
     e.set_defaults(func=cmd_dict)
 
     # ---- compile-css ------------------------------------------------------
-    f = sub.add_parser("compile-css",
-                       help="Write a print-style CSS with embedded fonts.")
-    f.add_argument("output", nargs="?", default="print-style.css",
-                   help="Output CSS path (default: print-style.css).")
-    f.add_argument("--font-dir", default=".",
-                   help="Directory holding the TTF files (default: .).")
+    f = sub.add_parser(
+        "compile-css", help="Write a print-style CSS with embedded fonts."
+    )
+    f.add_argument(
+        "output",
+        nargs="?",
+        default="print-style.css",
+        help="Output CSS path (default: print-style.css).",
+    )
+    f.add_argument(
+        "--font-dir", default=".", help="Directory holding the TTF files (default: .)."
+    )
     f.set_defaults(func=cmd_compile_css)
 
     return p

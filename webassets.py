@@ -344,8 +344,10 @@ def minify_html_hmin(path: Path, timeout: Optional[int] = None) -> Result:
         return Result(path, 0, 0, False, "file not found")
 
     try:
-        require_tool("html-minifier-terser",
-                     "Install it with: npm install -g html-minifier-terser")
+        require_tool(
+            "html-minifier-terser",
+            "Install it with: npm install -g html-minifier-terser",
+        )
     except RuntimeError as e:
         return Result(path, orig, orig, False, str(e))
 
@@ -368,7 +370,10 @@ def minify_html_hmin(path: Path, timeout: Optional[int] = None) -> Result:
         )
         if proc.returncode != 0:
             return Result(
-                path, orig, orig, False,
+                path,
+                orig,
+                orig,
+                False,
                 f"minification failed: {proc.stderr.strip()}",
             )
         out = _post_process_html(proc.stdout)
@@ -393,12 +398,18 @@ def minify_html_htmin(path: Path, timeout: int = 30) -> Result:
     orig = file_size(path)
 
     cmd = [
-        "html-minifier-terser", *HTML_HTMIN_FLAGS,
-        "--output", str(path), str(path),
+        "html-minifier-terser",
+        *HTML_HTMIN_FLAGS,
+        "--output",
+        str(path),
+        str(path),
     ]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         if proc.returncode != 0:
             err = proc.stderr.strip() or f"exit code {proc.returncode}"
@@ -424,7 +435,8 @@ def minify_css_csso(path: Path) -> Result:
     try:
         proc = subprocess.run(
             ["csso", "-i", str(path), "-o", str(path)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if proc.returncode != 0:
             return Result(path, orig, orig, False, proc.stderr.strip() or "csso error")
@@ -441,8 +453,9 @@ def minify_css_rcssmin(path: Path) -> Result:
     path = Path(path)
     orig = file_size(path)
     if _rcssmin is None:
-        return Result(path, orig, orig, False,
-                      "rcssmin not installed (pip install rcssmin)")
+        return Result(
+            path, orig, orig, False, "rcssmin not installed (pip install rcssmin)"
+        )
     try:
         content = path.read_text(encoding="utf-8")
         out = _rcssmin(content)
@@ -462,8 +475,9 @@ def minify_js_rjsmin(path: Path) -> Result:
     path = Path(path)
     orig = file_size(path)
     if _rjsmin is None:
-        return Result(path, orig, orig, False,
-                      "rjsmin not installed (pip install rjsmin)")
+        return Result(
+            path, orig, orig, False, "rjsmin not installed (pip install rjsmin)"
+        )
     try:
         content = path.read_text(encoding="utf-8")
         out = _rjsmin(content)
@@ -534,11 +548,13 @@ def minify_svg_svgcleaner(path: Path, skip_parts: Sequence[str] = ("lazy",)) -> 
             tmp_path = Path(f.name)
         proc = subprocess.run(
             ["svgcleaner", str(path), str(tmp_path)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if proc.returncode != 0:
-            return Result(path, orig, orig, False,
-                          proc.stderr.strip() or "svgcleaner failed")
+            return Result(
+                path, orig, orig, False, proc.stderr.strip() or "svgcleaner failed"
+            )
         new = file_size(tmp_path)
         if not new:
             return Result(path, orig, orig, False, "svgcleaner produced empty output")
@@ -560,7 +576,11 @@ def minify_svg_svgcleaner(path: Path, skip_parts: Sequence[str] = ("lazy",)) -> 
 # Truncate at last closing tag  (fixsvg.py)
 # ============================================================================
 DEFAULT_TRUNCATE_TAGS: tuple[str, ...] = (
-    "</svg>", "</html>", "</body>", "</script>", "</div>",
+    "</svg>",
+    "</html>",
+    "</body>",
+    "</script>",
+    "</div>",
 )
 
 
@@ -765,7 +785,10 @@ def _v_object(prefix: str, name: str, d: dict) -> None:
         return
 
     assert r["object_type"] in {
-        "ELEMENTARY", "BUILTIN", "MODULE", "RETURNED",
+        "ELEMENTARY",
+        "BUILTIN",
+        "MODULE",
+        "RETURNED",
     }, f"{prefix}.{name}"
     if r["object_type"] == "ELEMENTARY":
         assert name in _MESON_DB["objects_by_type"]["elementary"], f"{prefix}.{name}"
@@ -800,7 +823,8 @@ def validate_meson_json(doc_file: Path) -> int:
 
     obt = r["objects_by_type"]
     _v_keys(
-        "root.objects_by_type", obt,
+        "root.objects_by_type",
+        obt,
         {"elementary": list, "builtins": list, "returned": list, "modules": dict},
     )
     assert not obt, f"root.objects_by_type has extra keys: {obt.keys()}"
@@ -1007,46 +1031,80 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---------------- html ----------------
     ph = sub.add_parser("html", help="Minify HTML files.")
-    ph.add_argument("paths", nargs="*", default=["."],
-                    help="Files/directories to process (default: .).")
-    ph.add_argument("-b", "--backend", choices=("hmin", "htmin"), default="hmin",
-                    help="hmin = JSON-config + stdin/stdout (default); "
-                         "htmin = CLI-flags + in-place write.")
-    ph.add_argument("-t", "--timeout", type=int, default=30,
-                    help="Subprocess timeout in seconds (htmin backend only; default: 30).")
-    ph.add_argument("-j", "--processes", type=int, default=8,
-                    help="Worker processes (default: 8).")
-    ph.add_argument("--ext", default=".html,.htm",
-                    help="Comma-separated extensions (default: .html,.htm).")
+    ph.add_argument(
+        "paths",
+        nargs="*",
+        default=["."],
+        help="Files/directories to process (default: .).",
+    )
+    ph.add_argument(
+        "-b",
+        "--backend",
+        choices=("hmin", "htmin"),
+        default="hmin",
+        help="hmin = JSON-config + stdin/stdout (default); "
+        "htmin = CLI-flags + in-place write.",
+    )
+    ph.add_argument(
+        "-t",
+        "--timeout",
+        type=int,
+        default=30,
+        help="Subprocess timeout in seconds (htmin backend only; default: 30).",
+    )
+    ph.add_argument(
+        "-j", "--processes", type=int, default=8, help="Worker processes (default: 8)."
+    )
+    ph.add_argument(
+        "--ext",
+        default=".html,.htm",
+        help="Comma-separated extensions (default: .html,.htm).",
+    )
     ph.set_defaults(func=cmd_html)
 
     # ---------------- css ----------------
     pc = sub.add_parser("css", help="Minify CSS files.")
     pc.add_argument("paths", nargs="*", default=["."])
-    pc.add_argument("-b", "--backend", choices=("rcssmin", "csso"), default="rcssmin",
-                    help="rcssmin = pure Python (default); csso = external CLI.")
-    pc.add_argument("-j", "--processes", type=int, default=None,
-                    help="Worker processes (default: CPU count).")
-    pc.add_argument("--ext", default=".css",
-                    help="Comma-separated extensions (default: .css).")
+    pc.add_argument(
+        "-b",
+        "--backend",
+        choices=("rcssmin", "csso"),
+        default="rcssmin",
+        help="rcssmin = pure Python (default); csso = external CLI.",
+    )
+    pc.add_argument(
+        "-j",
+        "--processes",
+        type=int,
+        default=None,
+        help="Worker processes (default: CPU count).",
+    )
+    pc.add_argument(
+        "--ext", default=".css", help="Comma-separated extensions (default: .css)."
+    )
     pc.set_defaults(func=cmd_css)
 
     # ---------------- js ----------------
     pj = sub.add_parser("js", help="Minify JS files (rjsmin).")
     pj.add_argument("paths", nargs="*", default=["."])
     pj.add_argument("-j", "--processes", type=int, default=None)
-    pj.add_argument("--ext", default=".js",
-                    help="Comma-separated extensions (default: .js).")
+    pj.add_argument(
+        "--ext", default=".js", help="Comma-separated extensions (default: .js)."
+    )
     pj.set_defaults(func=cmd_js)
 
     # ---------------- json ----------------
     pq = sub.add_parser("json", help="Minify JSON files.")
     pq.add_argument("paths", nargs="*", default=["."])
-    pq.add_argument("--dry", action="store_true",
-                    help="Report what would change without writing.")
-    pq.add_argument("--spaced", action="store_true",
-                    help="Use default separators (jm2.py style) instead of "
-                         "compact separators (mjb.py style).")
+    pq.add_argument(
+        "--dry", action="store_true", help="Report what would change without writing."
+    )
+    pq.add_argument(
+        "--spaced",
+        action="store_true",
+        help="Use default separators (jm2.py style) instead of "
+        "compact separators (mjb.py style).",
+    )
     pq.add_argument("-j", "--processes", type=int, default=None)
     pq.add_argument("--ext", default=".json")
     pq.set_defaults(func=cmd_json)
@@ -1054,37 +1112,50 @@ def build_parser() -> argparse.ArgumentParser:
     # ---------------- svg ----------------
     ps = sub.add_parser("svg", help="Optimise SVG files (svgcleaner).")
     ps.add_argument("paths", nargs="*", default=["."])
-    ps.add_argument("--skip-part", action="append", default=["lazy"],
-                    help="Path part to skip; repeatable (default: lazy).")
+    ps.add_argument(
+        "--skip-part",
+        action="append",
+        default=["lazy"],
+        help="Path part to skip; repeatable (default: lazy).",
+    )
     ps.add_argument("-j", "--processes", type=int, default=None)
     ps.add_argument("--ext", default=".svg")
     ps.set_defaults(func=cmd_svg)
 
     # ---------------- truncate ----------------
-    pt = sub.add_parser("truncate",
-                        help="Truncate files at their last closing tag (fixsvg.py).")
+    pt = sub.add_parser(
+        "truncate", help="Truncate files at their last closing tag (fixsvg.py)."
+    )
     pt.add_argument("paths", nargs="*", default=["."])
-    pt.add_argument("--ext", default=".html,.htm,.svg,.xml",
-                    help="Extensions to process (default: .html,.htm,.svg,.xml).")
-    pt.add_argument("--tag", action="append", default=None,
-                    help="Closing tag to search for; repeatable. Defaults to "
-                         "</svg> </html> </body> </script> </div> in that order.")
+    pt.add_argument(
+        "--ext",
+        default=".html,.htm,.svg,.xml",
+        help="Extensions to process (default: .html,.htm,.svg,.xml).",
+    )
+    pt.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        help="Closing tag to search for; repeatable. Defaults to "
+        "</svg> </html> </body> </script> </div> in that order.",
+    )
     pt.add_argument("-j", "--processes", type=int, default=None)
     pt.set_defaults(func=cmd_truncate)
 
     # ---------------- mixed ----------------
-    pm = sub.add_parser("mixed",
-                        help="Dispatch CSS/JSON/HTML by extension (minjch.py).")
+    pm = sub.add_parser(
+        "mixed", help="Dispatch CSS/JSON/HTML by extension (minjch.py)."
+    )
     pm.add_argument("paths", nargs="*", default=["."])
     pm.add_argument("--ext", default=".css,.json,.html,.htm")
     pm.add_argument("-j", "--processes", type=int, default=None)
     pm.set_defaults(func=cmd_mixed)
 
     # ---------------- validate-meson-json ----------------
-    pv = sub.add_parser("validate-meson-json",
-                        help="Validate a Meson JSON-docs file.")
-    pv.add_argument("doc_file", type=Path,
-                    help="Path to the JSON docs file to validate.")
+    pv = sub.add_parser("validate-meson-json", help="Validate a Meson JSON-docs file.")
+    pv.add_argument(
+        "doc_file", type=Path, help="Path to the JSON docs file to validate."
+    )
     pv.set_defaults(func=cmd_validate_meson_json)
 
     return p

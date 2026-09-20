@@ -59,22 +59,80 @@ DEFAULT_TOP_N = 10
 
 # Fallback stdlib set used when importlib cannot enumerate a module list.
 STDLIB_FALLBACK: set[str] = {
-    "os", "sys", "re", "json", "math", "time", "datetime", "pathlib",
-    "collections", "itertools", "functools", "typing", "argparse", "logging",
-    "subprocess", "shutil", "tempfile", "hashlib", "base64", "uuid", "csv",
-    "io", "textwrap", "string", "random", "statistics", "decimal", "fractions",
-    "enum", "dataclasses", "abc", "copy", "pprint", "traceback", "warnings",
-    "contextlib", "threading", "multiprocessing", "socket", "http", "urllib",
-    "email", "xml", "html", "configparser", "ast", "inspect", "dis", "tokenize",
-    "compileall", "zipfile", "tarfile", "gzip", "bz2", "lzma", "pickle",
-    "shelve", "dbm", "sqlite3", "unittest", "doctest", "pdb", "profile",
-    "cProfile", "webbrowser", "tkinter", "turtle",
+    "os",
+    "sys",
+    "re",
+    "json",
+    "math",
+    "time",
+    "datetime",
+    "pathlib",
+    "collections",
+    "itertools",
+    "functools",
+    "typing",
+    "argparse",
+    "logging",
+    "subprocess",
+    "shutil",
+    "tempfile",
+    "hashlib",
+    "base64",
+    "uuid",
+    "csv",
+    "io",
+    "textwrap",
+    "string",
+    "random",
+    "statistics",
+    "decimal",
+    "fractions",
+    "enum",
+    "dataclasses",
+    "abc",
+    "copy",
+    "pprint",
+    "traceback",
+    "warnings",
+    "contextlib",
+    "threading",
+    "multiprocessing",
+    "socket",
+    "http",
+    "urllib",
+    "email",
+    "xml",
+    "html",
+    "configparser",
+    "ast",
+    "inspect",
+    "dis",
+    "tokenize",
+    "compileall",
+    "zipfile",
+    "tarfile",
+    "gzip",
+    "bz2",
+    "lzma",
+    "pickle",
+    "shelve",
+    "dbm",
+    "sqlite3",
+    "unittest",
+    "doctest",
+    "pdb",
+    "profile",
+    "cProfile",
+    "webbrowser",
+    "tkinter",
+    "turtle",
 }
 
 
 # ---------------------------------------------------------------------------
 # Stdlib discovery
 # ---------------------------------------------------------------------------
+
 
 def collect_stdlib_modules() -> set[str]:
     """Return the set of top-level stdlib module names."""
@@ -103,6 +161,7 @@ def collect_stdlib_modules() -> set[str]:
 # ---------------------------------------------------------------------------
 # AST import extraction
 # ---------------------------------------------------------------------------
+
 
 def extract_imports(path: Path) -> dict[str, list[str]]:
     """
@@ -178,6 +237,7 @@ def _record_package_attribute_calls(
 # Call counting
 # ---------------------------------------------------------------------------
 
+
 def count_calls(
     path: Path,
     imports: dict[str, list[str]],
@@ -240,11 +300,17 @@ def _extract_imports_full(
 # Analysis
 # ---------------------------------------------------------------------------
 
+
 def analyze_directory(
     directory: Path,
     package: str,
     stdlib: set[str],
-) -> tuple[list[tuple[str, dict[str, Counter[str]]]], dict[str, int], dict[str, int], dict[str, int]]:
+) -> tuple[
+    list[tuple[str, dict[str, Counter[str]]]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
     """
     Analyze all `.py` files in *directory*.
 
@@ -296,13 +362,21 @@ def analyze_directory(
     thirdparty_filecounts = {k: len(v) for k, v in thirdparty_files.items()}
     package_filecounts = {k: len(v) for k, v in package_files.items()}
 
-    return per_file, stdlib_totals, thirdparty_totals, package_totals, \
-        stdlib_filecounts, thirdparty_filecounts, package_filecounts
+    return (
+        per_file,
+        stdlib_totals,
+        thirdparty_totals,
+        package_totals,
+        stdlib_filecounts,
+        thirdparty_filecounts,
+        package_filecounts,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Report formatting
 # ---------------------------------------------------------------------------
+
 
 def build_report(
     per_file: list[tuple[str, dict[str, Counter[str]]]],
@@ -421,11 +495,14 @@ def build_report(
 # Charts (matplotlib)
 # ---------------------------------------------------------------------------
 
+
 def _load_matplotlib():
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         return plt
     except ImportError as exc:  # pragma: no cover
         raise SystemExit(
@@ -549,6 +626,7 @@ def generate_charts(
 # Subcommand handlers
 # ---------------------------------------------------------------------------
 
+
 def _run_analysis(args: argparse.Namespace) -> tuple[Any, str]:
     directory: Path = Path(args.dir).expanduser()
     if not directory.is_dir():
@@ -579,9 +657,7 @@ def _run_analysis(args: argparse.Namespace) -> tuple[Any, str]:
     if not per_file:
         print("✅ No imports found in any script.")
         output_path = Path(args.output).expanduser()
-        output_path.write_text(
-            f"No imports found in {directory}.\n", encoding="utf-8"
-        )
+        output_path.write_text(f"No imports found in {directory}.\n", encoding="utf-8")
         sys.exit(0)
 
     report = build_report(
@@ -634,6 +710,7 @@ def cmd_charts(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
