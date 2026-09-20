@@ -1,11 +1,8 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
-
 import ast
 import logging
 import operator
 from pathlib import Path
-
 from joblib import Parallel, delayed
 from xxhash import xxh64
 
@@ -20,7 +17,7 @@ logging.basicConfig(
 )
 
 
-def get_file_hash(path: Path) -> str:
+def get_file_hash(path):
     hasher = xxh64()
     with Path(path).open("rb") as f:
         while chunk := f.read(CHUNK_SIZE):
@@ -28,7 +25,7 @@ def get_file_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def extract_constants(path: Path) -> list[tuple[str, str, str]]:
+def extract_constants(path):
     constants = []
     try:
         with Path(path).open("r", encoding="utf-8") as f:
@@ -61,14 +58,14 @@ def extract_constants(path: Path) -> list[tuple[str, str, str]]:
     return constants
 
 
-def process_file(path: Path) -> tuple[str, list[tuple[str, str, str]] | None]:
+def process_file(path):
     file_hash = get_file_hash(path)
     Path(path)
     constants = extract_constants(path)
     return file_hash, constants
 
 
-def main() -> None:
+def main():
     cwd = Path.cwd()
     python_files = list(get_pyfiles(cwd))
     if not python_files:

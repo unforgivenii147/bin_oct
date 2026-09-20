@@ -1,674 +1,337 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
+"""Standalone HTML/CSS bundler: inline local and remote CSS/JS/images into HTML files by base64-encoding assets and replacing <link>/<script>/<img>/url() references, processing files in parallel with a fixed 8-process pool via multiprocessing.Pool.apply_async, using pathlib for all paths and loguru for logging."""
 
+import argparse
 import base64
 import mimetypes
-import multiprocessing as mp
 import re
 import sys
-from collections.abc import Iterable
+import time
+from multiprocessing import Pool
 from pathlib import Path
-from urllib.parse import unquote, urldefrag, urljoin, urlparse
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from loguru import logger
 
-WORKERS = 8
-REMOTE_SIZE_LIMIT = 5 * 1024 * 1024
-USER_AGENT = "Mozilla/5.0 (compatible; StandaloneHTML/2.0)"
-REMOTE_IMAGE_EXTENSIONS = {
-    ".apng",
-    ".avif",
-    ".bmp",
-    ".gif",
-    ".ico",
-    ".jpeg",
-    ".jpg",
+logger.remove()
+logger.add(
+    sys.stderr, level="WARNING", format="<red>{level}</red> | <cyan>{message}</cyan>"
+)
+
+IMAGE_EXTENSIONS: set[str] = {
     ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
     ".svg",
     ".webp",
+    ".ico",
+    ".avif",
+    ".bmp",
+    ".tiff",
 }
-HTML_EXTENSIONS = {".html", ".htm"}
-ASSET_ATTRIBUTES = {
-    "link": ("href",),
-    "script": ("src",),
-    "img": ("src",),
-    "source": ("src",),
-    "video": ("src", "poster"),
-    "audio": ("src",),
-    "object": ("data",),
-    "embed": ("src",),
-    "input": ("src",),
-    "track": ("src",),
-}
-_WORKER_ASSET_CACHE: dict[str, tuple[bytes, str]] = {}
+CSS_URL_PATTERN: re.Pattern[str] = re.compile(r'url\((["\']?)([^)"\']+)\1\)')
+TIMEOUT: int = 20
+POOL_SIZE: int = 8
 
 
-def make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
+def is_remote(url: str) -> bool:
+    """Return True if the URL refers to a remote resource (http/https or protocol-relative)."""
+    return urlparse(url).scheme in ("http", "https") or url.startswith("//")
 
 
-def is_remote_url(value: str | None) -> bool:
-    return bool(value and value.startswith(("http://", "https://")))
+def is_image(url: str) -> bool:
+    """Return True if the URL path has a recognized image file extension."""
+    ext = Path(urlparse(url).path).suffix.lower()
+    return ext in IMAGE_EXTENSIONS
 
 
-def is_data_url(value: str | None) -> bool:
-    return bool(value and value.lower().startswith("data:"))
+def get_mime_type(path: str) -> str:
+    """Guess the MIME type for a file path, with fallbacks for common web fonts."""
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        ext = Path(path).suffix.lower()
+        if ext == ".woff2":
+            return "font/woff2"
+        if ext == ".woff":
+            return "font/woff"
+        if ext == ".ttf":
+            return "font/ttf"
+        if ext == ".eot":
+            return "application/vnd.ms-fontobject"
+        return "application/octet-stream"
+    return mime
 
 
-def clean_url(value: str) -> str:
-    value = value.strip()
-    value, _fragment = urldefrag(value)
-    return value
-
-
-def resolve_url(
-    value: str,
-    base: Path | str,
-) -> str:
-    value = clean_url(value)
-    if value.startswith("//"):
-        return "https:" + value
-    if value.startswith(("http://", "https://", "data:", "#")):
-        return value
-    if isinstance(base, Path):
-        if value.startswith("/"):
-            return str(Path(value).resolve())
-        return str((base / unquote(value)).resolve())
-    return urljoin(str(base), value)
-
-
-def guess_mime(
-    url: str,
-    content_type: str | None = None,
-) -> str:
-    if content_type:
-        mime = content_type.split(";", 1)[0].strip().lower()
-        if mime:
-            return mime
-    path = urlparse(url).path
-    mime, _encoding = mimetypes.guess_type(path)
-    return mime or "application/octet-stream"
-
-
-def is_image_url(
-    url: str,
-    content_type: str | None = None,
-) -> bool:
-    if content_type:
-        return content_type.lower().split(";", 1)[0].startswith("image/")
-    suffix = Path(urlparse(url).path).suffix.lower()
-    return suffix in REMOTE_IMAGE_EXTENSIONS
-
-
-def to_data_uri(content: bytes, mime: str) -> str:
-    encoded = base64.b64encode(content).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def get_remote_size(
-    session: requests.Session,
-    url: str,
-) -> tuple[int | None, str | None]:
+def fetch_remote(url: str) -> bytes | None:
+    """Fetch a remote URL and return its bytes, or None on failure."""
+    if url.startswith("//"):
+        url = "https:" + url
     try:
-        response = session.head(
-            url,
-            timeout=15,
-            allow_redirects=True,
-        )
-        content_length = response.headers.get("Content-Length")
-        content_type = response.headers.get("Content-Type")
-        size = None
-        if content_length:
-            try:
-                size = int(content_length)
-            except ValueError:
-                size = None
-        return size, content_type
-    except requests.RequestException:
-        return None, None
-
-
-def ask_download_confirmation(
-    url: str,
-    size: int,
-) -> bool:
-    size_mb = size / (1024 * 1024)
-    print()
-    print(f"⚠ Remote file is {size_mb:.2f} MiB:")
-    print(f"  {url}")
-    answer = input("Download it? [y/N]: ").strip().lower()
-    return answer in {"y", "yes"}
-
-
-def download_remote_assets(
-    urls: Iterable[str],
-) -> dict[str, tuple[bytes, str]]:
-    session = make_session()
-    cache: dict[str, tuple[bytes, str]] = {}
-    for url in sorted(set(urls)):
-        size, content_type = get_remote_size(session, url)
-        if is_image_url(url, content_type):
-            print(f"  ⊘ skipped remote image: {url}")
-            continue
-        if (
-            size is not None
-            and size >= REMOTE_SIZE_LIMIT
-            and not ask_download_confirmation(url, size)
-        ):
-            print(f"  ⊘ skipped by user: {url}")
-            continue
-        try:
-            response = session.get(
-                url,
-                timeout=30,
-                allow_redirects=True,
-            )
+        with requests.get(url, timeout=TIMEOUT) as response:
             response.raise_for_status()
-            final_url = clean_url(response.url)
-            response_type = response.headers.get("Content-Type")
-            mime = guess_mime(final_url, response_type)
-            actual_size = len(response.content)
-            if actual_size >= REMOTE_SIZE_LIMIT and size is None:
-                if not ask_download_confirmation(url, actual_size):
-                    print(f"  ⊘ skipped by user: {url}")
-                    continue
-            if is_image_url(final_url, response_type):
-                print(f"  ⊘ skipped remote image: {url}")
+            return response.content
+    except Exception as e:
+        logger.error(f"Failed to fetch {url}: {e}")
+        return None
+
+
+def read_local(path: Path) -> bytes | None:
+    """Read a local file and return its bytes, or None on failure."""
+    try:
+        return path.read_bytes()
+    except Exception as e:
+        logger.error(f"Failed to read {path}: {e}")
+        return None
+
+
+def process_css_content(
+    css_content: str, base_path: Path, base_url: str | None = None
+) -> tuple[str, int, int]:
+    """Inline url() references in CSS content with base64 data URIs.
+
+    Returns the transformed CSS, the number of local resources inlined, and
+    the number of remote resources inlined.
+    """
+    loc: int = 0
+    rem: int = 0
+
+    def replacer(match: re.Match[str]) -> str:
+        nonlocal loc, rem
+        quote: str = match.group(1)
+        url: str = match.group(2)
+        if url.startswith("data:"):
+            return match.group(0)
+        if is_remote(url):
+            if is_image(url):
+                return match.group(0)
+            target_url: str = urljoin(base_url, url) if base_url else url
+            content = fetch_remote(target_url)
+            if content:
+                mime = get_mime_type(urlparse(target_url).path)
+                b64 = base64.b64encode(content).decode("ascii")
+                rem += 1
+                return f"url({quote}data:{mime};base64,{b64}{quote})"
+            return match.group(0)
+        else:
+            clean_url: str = url.split("?")[0].split("#")[0]
+            local_file: Path = (base_path.parent / clean_url).resolve()
+            if not local_file.exists():
+                logger.warning(f"Missing local CSS asset referenced: {local_file}")
+                return match.group(0)
+            content = read_local(local_file)
+            if content:
+                mime = get_mime_type(str(local_file))
+                b64 = base64.b64encode(content).decode("ascii")
+                loc += 1
+                return f"url({quote}data:{mime};base64,{b64}{quote})"
+            return match.group(0)
+
+    new_css: str = CSS_URL_PATTERN.sub(replacer, css_content)
+    return new_css, loc, rem
+
+
+def process_html_file(path: Path) -> dict[str, Any]:
+    """Inline linked CSS/JS and image references in a single HTML file."""
+    stats: dict[str, Any] = {
+        "path": str(path),
+        "local": 0,
+        "remote": 0,
+        "time": 0.0,
+        "status": "success",
+    }
+    start: float = time.perf_counter()
+    try:
+        html_text: str = path.read_text(encoding="utf-8")
+        soup: BeautifulSoup = BeautifulSoup(html_text, "html.parser")
+        for img in soup.find_all("img"):
+            src: str | None = img.get("src")
+            if not src or src.startswith("data:"):
                 continue
-            asset = (response.content, mime)
-            cache[url] = asset
-            cache[final_url] = asset
-            print(f"  ↓ downloaded once: {url}")
-        except requests.RequestException as exc:
-            print(f"  ⚠ failed to download {url}: {exc}")
-    return cache
-
-
-CSS_URL_RE = re.compile(
-    r"url\(\s*[\"']?([^\"')]+?)[\"']?\s*\)",
-    flags=re.IGNORECASE,
-)
-CSS_IMPORT_RE = re.compile(
-    r"@import\s+" r"(?:url\(\s*)?" r"[\"']?([^\"')\s;]+)" r"[\"']?\s*\)?",
-    flags=re.IGNORECASE,
-)
-
-
-def add_remote_url(
-    urls: set[str],
-    value: str | None,
-    base: Path | str,
-) -> None:
-    if not value:
-        return
-    value = value.strip().strip("\"'")
-    if not value or is_data_url(value) or value.startswith("#"):
-        return
-    resolved = resolve_url(value, base)
-    if is_remote_url(resolved):
-        urls.add(clean_url(resolved))
-
-
-def collect_css_urls(
-    css_text: str,
-    base: Path | str,
-    urls: set[str],
-) -> list[tuple[str, str]]:
-    imported_stylesheets: list[tuple[str, str]] = []
-    for match in CSS_IMPORT_RE.finditer(css_text):
-        value = match.group(1).strip()
-        resolved = resolve_url(value, base)
-        if is_remote_url(resolved):
-            urls.add(clean_url(resolved))
-            imported_stylesheets.append((clean_url(resolved), clean_url(resolved)))
-        elif isinstance(base, Path):
-            local_css = Path(resolved)
-            if local_css.is_file():
-                imported_stylesheets.append((str(local_css), str(local_css)))
-    for match in CSS_URL_RE.finditer(css_text):
-        add_remote_url(urls, match.group(1), base)
-    return imported_stylesheets
-
-
-def collect_remote_assets(
-    html_path: Path,
-) -> set[str]:
-    urls: set[str] = set()
-    css_to_scan: list[tuple[str, Path | str]] = []
-    scanned_css: set[str] = set()
-    try:
-        html_text = html_path.read_text(
-            encoding="utf-8-sig",
-            errors="replace",
-        )
-    except OSError as exc:
-        print(f"⚠ cannot scan {html_path}: {exc}")
-        return urls
-    soup = BeautifulSoup(html_text, "html.parser")
-    for tag_name, attributes in ASSET_ATTRIBUTES.items():
-        for tag in soup.find_all(tag_name):
-            for attribute in attributes:
-                value = tag.get(attribute)
-                if not value:
-                    continue
-                resolved = resolve_url(value, html_path.parent)
-                if tag_name == "link" and "stylesheet" in {
-                    item.lower()
-                    for item in (
-                        tag.get("rel", [])
-                        if isinstance(tag.get("rel", []), list)
-                        else [tag.get("rel")]
-                    )
-                    if item
-                }:
-                    if is_remote_url(resolved):
-                        urls.add(clean_url(resolved))
-                        css_to_scan.append((clean_url(resolved), clean_url(resolved)))
-                    else:
-                        local_css = Path(resolved)
-                        if local_css.is_file():
-                            css_to_scan.append((str(local_css), local_css))
-                    continue
-                add_remote_url(urls, value, html_path.parent)
-    for tag in soup.find_all(srcset=True):
-        for item in tag["srcset"].split(","):
-            candidate = item.strip().split()
-            if candidate:
-                add_remote_url(
-                    urls,
-                    candidate[0],
-                    html_path.parent,
-                )
-    for style in soup.find_all("style"):
-        css_to_scan.extend(
-            collect_css_urls(
-                style.get_text(),
-                html_path.parent,
-                urls,
-            )
-        )
-    for tag in soup.find_all(style=True):
-        collect_css_urls(
-            tag["style"],
-            html_path.parent,
-            urls,
-        )
-    session = make_session()
-    while css_to_scan:
-        css_identifier, _css_base = css_to_scan.pop()
-        if css_identifier in scanned_css:
-            continue
-        scanned_css.add(css_identifier)
-        try:
-            if is_remote_url(css_identifier):
-                response = session.get(
-                    css_identifier,
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                response.raise_for_status()
-                css_text = response.content.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-                actual_base: Path | str = clean_url(response.url)
+            if is_remote(src):
+                continue
+            clean_src: str = src.split("?")[0].split("#")[0]
+            local_img_path: Path = (path.parent / clean_src).resolve()
+            if local_img_path.exists():
+                content = read_local(local_img_path)
+                if content:
+                    b64 = base64.b64encode(content).decode("ascii")
+                    mime = get_mime_type(str(local_img_path))
+                    img["src"] = f"data:{mime};base64,{b64}"
+                    stats["local"] += 1
             else:
-                css_path = Path(css_identifier)
-                css_text = css_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
+                logger.warning(f"Missing local image: {local_img_path} in {path}")
+        for link in soup.find_all("link", rel="stylesheet"):
+            href: str | None = link.get("href")
+            if not href:
+                continue
+            css_text: str = ""
+            base_url: str | None = None
+            css_base_path: Path = path
+            if is_remote(href):
+                raw = fetch_remote(href)
+                if raw:
+                    css_text = raw.decode("utf-8", errors="ignore")
+                    base_url = href
+                    stats["remote"] += 1
+            else:
+                clean_href: str = href.split("?")[0].split("#")[0]
+                local_css_path: Path = (path.parent / clean_href).resolve()
+                if local_css_path.exists():
+                    css_text = local_css_path.read_text(
+                        encoding="utf-8", errors="ignore"
+                    )
+                    css_base_path = local_css_path
+                    stats["local"] += 1
+                else:
+                    logger.warning(f"Missing local CSS: {local_css_path} in {path}")
+            if css_text:
+                processed_css, c_loc, c_rem = process_css_content(
+                    css_text, css_base_path, base_url
                 )
-                actual_base = css_path.parent
-            css_to_scan.extend(
-                collect_css_urls(
-                    css_text,
-                    actual_base,
-                    urls,
-                )
-            )
-        except (OSError, requests.RequestException) as exc:
-            print(f"⚠ cannot scan CSS {css_identifier}: {exc}")
-    return urls
+                stats["local"] += c_loc
+                stats["remote"] += c_rem
+                style_tag = soup.new_tag("style")
+                style_tag.string = processed_css
+                link.replace_with(style_tag)
+        for script in soup.find_all("script"):
+            src: str | None = script.get("src")
+            if not src:
+                continue
+            script_text: str = ""
+            if is_remote(src):
+                raw = fetch_remote(src)
+                if raw:
+                    script_text = raw.decode("utf-8", errors="ignore")
+                    stats["remote"] += 1
+            else:
+                clean_src = src.split("?")[0].split("#")[0]
+                local_script: Path = (path.parent / clean_src).resolve()
+                if local_script.exists():
+                    script_text = local_script.read_text(
+                        encoding="utf-8", errors="ignore"
+                    )
+                    stats["local"] += 1
+                else:
+                    logger.warning(f"Missing local script: {local_script} in {path}")
+            if script_text:
+                new_script = soup.new_tag("script")
+                new_script.string = script_text
+                script.replace_with(new_script)
+        for tag in soup.find_all(style=True):
+            processed, l, r = process_css_content(tag["style"], path)
+            tag["style"] = processed
+            stats["local"] += l
+            stats["remote"] += r
+        for style in soup.find_all("style"):
+            if style.string:
+                processed, l, r = process_css_content(style.string, path)
+                style.string = processed
+                stats["local"] += l
+                stats["remote"] += r
+        path.write_text(str(soup), encoding="utf-8")
+    except Exception as e:
+        stats["status"] = f"error: {e}"
+        logger.error(f"Failed to process HTML file {path}: {e}")
+    stats["time"] = time.perf_counter() - start
+    return stats
 
 
-def fetch_asset(
-    value: str | None,
-    base_dir: Path,
-    asset_cache: dict[str, tuple[bytes, str]],
-):
-    if not value or is_data_url(value) or value.startswith("#"):
-        return None, None
-    resolved = resolve_url(value, base_dir)
-    if is_remote_url(resolved):
-        if is_image_url(resolved):
-            print(f"  ⊘ skipped remote image: {value}")
-            return None, None
-        asset = asset_cache.get(resolved)
-        if asset is None:
-            return None, None
-        print(f"  ⟳ reused cached asset: {resolved}")
-        return asset
-    local_path = Path(resolved)
-    if not local_path.is_file():
-        print(f"  ⚠ local file not found: {local_path}")
-        return None, None
+def process_css_file(path: Path) -> dict[str, Any]:
+    """Inline url() references in a single CSS file."""
+    stats: dict[str, Any] = {
+        "path": str(path),
+        "local": 0,
+        "remote": 0,
+        "time": 0.0,
+        "status": "success",
+    }
+    start: float = time.perf_counter()
     try:
-        content = local_path.read_bytes()
-        mime = guess_mime(str(local_path))
-        return content, mime
-    except OSError as exc:
-        print(f"  ⚠ cannot read {local_path}: {exc}")
-        return None, None
+        content: str = path.read_text(encoding="utf-8")
+        processed_css, l, r = process_css_content(content, path)
+        stats["local"] += l
+        stats["remote"] += r
+        path.write_text(processed_css, encoding="utf-8")
+    except Exception as e:
+        stats["status"] = f"error: {e}"
+        logger.error(f"Failed to process CSS file {path}: {e}")
+    stats["time"] = time.perf_counter() - start
+    return stats
 
 
-def process_css(
-    css_text: str,
-    base_dir: Path,
-    asset_cache: dict[str, tuple[bytes, str]],
-) -> str:
-    def replace_import(match: re.Match) -> str:
-        original = match.group(0)
-        value = match.group(1).strip()
-        content, _mime = fetch_asset(
-            value,
-            base_dir,
-            asset_cache,
-        )
-        if content is None:
-            return original
-        imported_css = content.decode(
-            "utf-8",
-            errors="replace",
-        )
-        imported_base = base_dir
-        if is_remote_url(value):
-            imported_base = Path(".")
-        else:
-            imported_base = Path(resolve_url(value, base_dir)).parent
-        return process_css(
-            imported_css,
-            imported_base,
-            asset_cache,
-        )
-
-    css_text = CSS_IMPORT_RE.sub(
-        replace_import,
-        css_text,
-    )
-
-    def replace_url(match: re.Match) -> str:
-        original = match.group(0)
-        value = match.group(1).strip()
-        if value.startswith(("#", "data:")):
-            return original
-        resolved = resolve_url(value, base_dir)
-        if is_remote_url(resolved) and is_image_url(resolved):
-            print(f"  ⊘ skipped remote CSS image: {resolved}")
-            return original
-        content, mime = fetch_asset(
-            value,
-            base_dir,
-            asset_cache,
-        )
-        if content is None:
-            return original
-        return f'url("{to_data_uri(content, mime)}")'
-
-    return CSS_URL_RE.sub(replace_url, css_text)
-
-
-def process_srcset(
-    srcset: str,
-    base_dir: Path,
-    asset_cache: dict[str, tuple[bytes, str]],
-) -> str:
-    output: list[str] = []
-    for item in srcset.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        tokens = item.split()
-        value = tokens[0]
-        descriptor = " ".join(tokens[1:])
-        resolved = resolve_url(value, base_dir)
-        if is_remote_url(resolved) and is_image_url(resolved):
-            print(f"  ⊘ skipped remote srcset image: {resolved}")
-            output.append(item)
-            continue
-        content, mime = fetch_asset(
-            value,
-            base_dir,
-            asset_cache,
-        )
-        if content is None:
-            output.append(item)
-            continue
-        data_uri = to_data_uri(content, mime)
-        output.append(f"{data_uri} {descriptor}" if descriptor else data_uri)
-    return ", ".join(output)
-
-
-def replace_attribute_asset(
-    tag,
-    attribute: str,
-    base_dir: Path,
-    asset_cache: dict[str, tuple[bytes, str]],
-) -> None:
-    value = tag.get(attribute)
-    if not value or is_data_url(value):
-        return
-    resolved = resolve_url(value, base_dir)
-    if is_remote_url(resolved) and is_image_url(resolved):
-        print(f"  ⊘ skipped remote image: {resolved}")
-        return
-    content, mime = fetch_asset(
-        value,
-        base_dir,
-        asset_cache,
-    )
-    if content is not None:
-        tag[attribute] = to_data_uri(content, mime)
-
-
-def make_standalone(
-    html_path_string: str,
-) -> bool:
-    html_path = Path(html_path_string).resolve()
-    base_dir = html_path.parent
-    asset_cache = _WORKER_ASSET_CACHE
-    try:
-        html_text = html_path.read_text(
-            encoding="utf-8-sig",
-            errors="replace",
-        )
-    except OSError as exc:
-        print(f"ERROR: cannot read {html_path}: {exc}")
-        return False
-    print(f"Processing: {html_path}")
-    soup = BeautifulSoup(html_text, "html.parser")
-    for link in soup.find_all("link", rel=True):
-        rels = link.get("rel", [])
-        rels = rels if isinstance(rels, list) else [rels]
-        rels = {str(item).lower() for item in rels if item}
-        if "stylesheet" not in rels:
-            continue
-        href = link.get("href")
-        content, _mime = fetch_asset(
-            href,
-            base_dir,
-            asset_cache,
-        )
-        if content is None:
-            continue
-        css = content.decode(
-            "utf-8",
-            errors="replace",
-        )
-        css = process_css(
-            css,
-            base_dir,
-            asset_cache,
-        )
-        style = soup.new_tag("style")
-        style.string = css
-        link.replace_with(style)
-    for link in soup.find_all("link", href=True):
-        rels = link.get("rel", [])
-        rels = rels if isinstance(rels, list) else [rels]
-        rels = {str(item).lower() for item in rels if item}
-        if "stylesheet" in rels or "manifest" in rels:
-            continue
-        replace_attribute_asset(
-            link,
-            "href",
-            base_dir,
-            asset_cache,
-        )
-    for script in soup.find_all("script", src=True):
-        content, _mime = fetch_asset(
-            script.get("src"),
-            base_dir,
-            asset_cache,
-        )
-        if content is None:
-            continue
-        javascript = content.decode(
-            "utf-8",
-            errors="replace",
-        )
-        javascript = re.sub(
-            r"\n?//#\s*sourceMappingURL=.*",
-            "",
-            javascript,
-        )
-        javascript = re.sub(
-            r"</script",
-            r"<\\/script",
-            javascript,
-            flags=re.IGNORECASE,
-        )
-        del script["src"]
-        script.string = javascript
-    for img in soup.find_all("img", src=True):
-        replace_attribute_asset(
-            img,
-            "src",
-            base_dir,
-            asset_cache,
-        )
-    for tag in soup.find_all(srcset=True):
-        tag["srcset"] = process_srcset(
-            tag["srcset"],
-            base_dir,
-            asset_cache,
-        )
-    for tag_name, attributes in ASSET_ATTRIBUTES.items():
-        if tag_name in {"link", "script", "img"}:
-            continue
-        for tag in soup.find_all(tag_name):
-            for attribute in attributes:
-                replace_attribute_asset(
-                    tag,
-                    attribute,
-                    base_dir,
-                    asset_cache,
-                )
-    for style in soup.find_all("style"):
-        css = style.get_text()
-        if css:
-            css = re.sub(r"^\s*<!--\s*", "", css)
-            css = re.sub(r"\s*-->\s*$", "", css)
-            style.string = process_css(
-                css,
-                base_dir,
-                asset_cache,
-            )
-    for tag in soup.find_all(style=True):
-        if tag["style"]:
-            tag["style"] = process_css(
-                tag["style"],
-                base_dir,
-                asset_cache,
-            )
-    try:
-        html_path.write_text(
-            str(soup),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        print(f"ERROR: cannot write {html_path}: {exc}")
-        return False
-    print(f"✓ Done: {html_path}")
-    return True
-
-
-def init_worker(
-    asset_cache: dict[str, tuple[bytes, str]],
-) -> None:
-    global _WORKER_ASSET_CACHE
-    _WORKER_ASSET_CACHE = asset_cache
-
-
-def find_html_files(
-    inputs: list[str],
-) -> list[Path]:
-    paths = [Path(value).resolve() for value in inputs] if inputs else [Path.cwd()]
-    results: set[Path] = set()
-    for path in paths:
-        if path.is_file():
-            if path.suffix.lower() in HTML_EXTENSIONS:
-                results.add(path)
-        elif path.is_dir():
-            for item in path.rglob("*"):
-                if item.is_file() and item.suffix.lower() in HTML_EXTENSIONS:
-                    results.add(item)
-        else:
-            print(f"⚠ input does not exist: {path}")
-    return sorted(results)
+def process_file(path: Path) -> dict[str, Any]:
+    """Dispatch a file to the appropriate processor based on its extension."""
+    if path.suffix.lower() == ".html" or path.suffix.lower() == ".htm":
+        return process_html_file(path)
+    elif path.suffix.lower() == ".css":
+        return process_css_file(path)
+    return {
+        "path": str(path),
+        "local": 0,
+        "remote": 0,
+        "time": 0.0,
+        "status": "skipped",
+    }
 
 
 def main() -> int:
-    html_files = find_html_files(sys.argv[1:])
-    if not html_files:
-        print("No HTML files found.")
-        return 1
-    print(f"Found {len(html_files)} HTML file(s).")
-    print("Scanning for remote assets...")
-    all_remote_urls: set[str] = set()
-    for html_path in html_files:
-        all_remote_urls.update(collect_remote_assets(html_path))
-    print(f"Found {len(all_remote_urls)} unique remote asset URL(s).")
-    asset_cache = download_remote_assets(all_remote_urls)
-    print(f"Cached {len(asset_cache)} remote asset reference(s).")
-    print(f"Processing with {WORKERS} workers...")
-    with mp.Pool(
-        processes=WORKERS,
-        initializer=init_worker,
-        initargs=(asset_cache,),
-    ) as pool:
-        jobs = [
-            pool.apply_async(
-                make_standalone,
-                (str(html_path),),
-            )
-            for html_path in html_files
-        ]
-        results = []
-        for job in jobs:
+    """Parse arguments, discover target files, and process them in parallel."""
+    parser = argparse.ArgumentParser(description="Standalone HTML/CSS Bundler Tool")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        default=["."],
+        help="Files or directories to process (default: current directory)",
+    )
+    args = parser.parse_args()
+    targets: list[Path] = []
+    for p_str in args.paths:
+        p = Path(p_str)
+        if p.is_file() and p.suffix.lower() in (".html", ".css", ".htm"):
+            targets.append(p)
+        elif p.is_dir():
+            targets.extend(p.rglob("*.html"))
+            targets.extend(p.rglob("*.htm"))
+            targets.extend(p.rglob("*.css"))
+    targets = list({p.resolve(): p for p in targets}.values())
+    if not targets:
+        logger.warning("No HTML or CSS files found to process.")
+        return 0
+    print(f"Processing {len(targets)} files across multiple CPU cores...\n")
+    t_loc: int = 0
+    t_rem: int = 0
+    start_time: float = time.perf_counter()
+    with Pool(processes=POOL_SIZE) as pool:
+        async_results = [pool.apply_async(process_file, (p,)) for p in targets]
+        for async_result in async_results:
+            s: dict[str, Any] = async_result.get()
+            raw_path = Path(s["path"])
             try:
-                results.append(job.get())
-            except Exception as exc:
-                print(f"⚠ worker failed: {exc}")
-                results.append(False)
-    successful = sum(bool(result) for result in results)
-    print()
-    print(f"Processed {successful}/{len(html_files)} file(s).")
-    return 0 if successful == len(html_files) else 1
+                display_path: Path = raw_path.relative_to(Path.cwd())
+            except ValueError:
+                display_path = raw_path
+            t_loc += s["local"]
+            t_rem += s["remote"]
+            status: str = s["status"]
+            if status == "success":
+                print(
+                    f"[SUCCESS] {display_path} "
+                    f"({s['time']:.2f}s) - Embedded: "
+                    f"{s['local']} local, {s['remote']} remote"
+                )
+            elif status == "skipped":
+                pass
+            else:
+                logger.error(f"[ERROR] {display_path} - {status}")
+    total_time: float = time.perf_counter() - start_time
+    print(f"\nBuild Complete in {total_time:.2f}s!")
+    print(f"Total globally embedded resources: {t_loc} local, {t_rem} remote.")
+    return 0
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     raise SystemExit(main())

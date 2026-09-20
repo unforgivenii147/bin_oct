@@ -5,7 +5,7 @@ inside each wheel to recover the true package name and version, then renames fil
 the canonical PEP 427 wheel filename format. Use loguru for logging, pathlib for all
 path handling, multiprocessing.Pool.apply_async with a fixed pool of 8 workers for
 parallel info extraction, and full strict type annotations throughout. Support CLI
-flags: directory, --execute, --no-backup, --info-only. Provide a dry-run default.
+flags: directory, --apply, --no-backup, --info-only. Provide a dry-run default.
 """
 
 from __future__ import annotations
@@ -233,7 +233,7 @@ def fix_whl_files_by_metadata(
         print("Would rename: {} files", renamed_count)
         print("Would skip/error: {}", len(failed_files))
     if dry_run and renamed_count > 0:
-        print("Dry run complete. Run with --execute to apply changes.")
+        print("Dry run complete. Run with --apply to apply changes.")
     return renamed_count, failed_files
 
 
@@ -314,13 +314,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory containing .whl files (default: current directory)",
     )
     parser.add_argument(
-        "--execute",
-        "-e",
+        "--apply",
+        "-a",
         action="store_true",
         help="Actually rename files (dry run by default)",
     )
     parser.add_argument(
         "--no-backup",
+        "-b",
+        default=True,
         action="store_true",
         help="Skip creating backups (backups are created by default)",
     )
@@ -348,7 +350,7 @@ def main() -> int:
     else:
         fix_whl_files_by_metadata(
             directory=args.directory,
-            dry_run=not args.execute,
+            dry_run=not args.apply,
             backup=not args.no_backup,
         )
     return 0
