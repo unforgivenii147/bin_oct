@@ -1,260 +1,602 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-"""Convert TTF/OTF/WOFF/WOFF2 font files using fontTools.
+"""
+font_toolkit.py — merged font conversion utilities.
 
-Prompt: Write a Python CLI script that recursively finds TTF, OTF, WOFF, and WOFF2
-font files from given paths (or the current directory), converts each to a target
-format using fontTools (woff/woff2 via flavor, ttf/otf only when outline tables
-already match), optionally deletes the original after success, runs conversions in
-a multiprocessing.Pool of 8 workers, logs with loguru, uses pathlib for all path
-handling, and prints a final report table with sizes, ratios, times, and totals.
+Original scripts and their equivalents:
+  font_convert.py       -> python font_toolkit.py convert --to <fmt> [paths...] [--rm]
+  otf2ttf.py            -> python font_toolkit.py otf2ttf [paths...] [--workers N] [--keep-source]
+  otf_to_ttf.py         -> python font_toolkit.py otf2ttf-fontforge [paths...] [--keep-source]
+  tottf.py              -> python font_toolkit.py tottf [paths...] [--remove-source]
+  woff22ttf.py          -> python font_toolkit.py woff22ttf [paths...] [--workers N] [--keep-source]
+
+Third-party dependencies:
+  fontTools   (pip install fonttools)   — required for convert, otf2ttf, woff22ttf
+  fontforge   (system package)          — required for otf2ttf-fontforge and tottf
+
+Usage examples:
+  # Convert all fonts in current dir to woff2, remove originals
+  python font_toolkit.py convert --to woff2 --rm
+
+  # Convert specific OTF files to TTF with 8 workers, keep originals
+  python font_toolkit.py otf2ttf font1.otf font2.otf --workers 8 --keep-source
+
+  # Convert OTF to TTF using FontForge (keeps originals)
+  python font_toolkit.py otf2ttf-fontforge ./fonts
+
+  # Convert svg/woff/eot/otf/ttc to TTF using FontForge CLI, remove source
+  python font_toolkit.py tottf --remove-source ./assets
+
+  # Decompress WOFF2 to TTF, remove originals
+  python font_toolkit.py woff22ttf ./webfonts
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import time
-from dataclasses import dataclass
-from multiprocessing import Pool
+import multiprocessing
+import subprocess
+import sys
 from pathlib import Path
-from typing import Final
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
-from dh import fsz
-from fontTools.ttLib import TTFont, TTLibError
-from loguru import logger
+# ---------------------------------------------------------------------------
+# Optional third-party imports
+# ---------------------------------------------------------------------------
+try:
+    from fontTools.ttLib import TTFont
+    from fontTools.ttLib import woff2
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
 
-SUPPORTED_EXTS: Final[frozenset[str]] = frozenset({".ttf", ".otf", ".woff", ".woff2"})
-VALID_TARGETS: Final[frozenset[str]] = frozenset({"ttf", "otf", "woff", "woff2"})
-CFF_TABLES: Final[frozenset[str]] = frozenset({"CFF ", "CFF2"})
-TRUETYPE_TABLE: Final[str] = "glyf"
-POOL_SIZE: Final[int] = 8
+    HAS_FONTTOOLS = True
+except ImportError:
+    HAS_FONTTOOLS = False
 
-
-@dataclass
-class ConvResult:
-    """Result of converting a single font file."""
-
-    src: Path
-    dst: Path | None = None
-    ok: bool = False
-    skipped_reason: str | None = None
-    error: str | None = None
-    src_size: int = 0
-    dst_size: int = 0
-    seconds: float = 0.0
-    removed_src: bool = False
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 
-def iter_font_files(paths: list[Path]) -> list[Path]:
-    """Return a sorted list of font files found in the given files/directories."""
-    found: set[Path] = set()
-    for p in paths:
+def unique_path(path: Path) -> Path:
+    """Return a path that does not exist by appending _1, _2, ... before suffix."""
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    counter = 1
+    while True:
+        new_path = parent / f"{stem}_{counter}{suffix}"
+        if not new_path.exists():
+            return new_path
+        counter += 1
+
+
+def collect_files(
+    paths: Sequence[str],
+    extensions: Sequence[str],
+) -> List[Path]:
+    """
+    Collect files from given paths (files or directories).
+    If no paths given, scan the current working directory recursively.
+    Extensions are matched case-insensitively and should include the dot (e.g. '.ttf').
+    """
+    ext_set = {ext.lower() for ext in extensions}
+    result: List[Path] = []
+
+    if not paths:
+        paths = [str(Path.cwd())]
+
+    for p_str in paths:
+        p = Path(p_str)
         if p.is_dir():
-            for ext in SUPPORTED_EXTS:
-                found.update(p.rglob(f"*{ext}"))
+            for f in p.rglob("*"):
+                if f.is_file() and f.suffix.lower() in ext_set:
+                    result.append(f)
         elif p.is_file():
-            if p.suffix.lower() in SUPPORTED_EXTS:
-                found.add(p)
+            if p.suffix.lower() in ext_set:
+                result.append(p)
             else:
-                logger.warning(f"ignoring non-font file: {p}")
-    return sorted(found)
-
-
-def _outline_kind(font: TTFont) -> str:
-    """Return the outline kind of a font: 'cff', 'truetype', or 'unknown'."""
-    tags: set[str] = set(font.keys())
-    if tags & CFF_TABLES:
-        return "cff"
-    if TRUETYPE_TABLE in tags:
-        return "truetype"
-    return "unknown"
-
-
-def convert_one(src: Path, target: str, remove_src: bool) -> ConvResult:
-    """Convert a single font file to the target format."""
-    start: float = time.perf_counter()
-    res: ConvResult = ConvResult(src=src)
-    try:
-        res.src_size = src.stat().st_size
-    except OSError as exc:
-        res.error = f"stat failed: {exc}"
-        res.seconds = time.perf_counter() - start
-        return res
-    print(f"processing ... {src.name}")
-    dst: Path = src.with_suffix(f".{target}")
-    if dst == src:
-        res.skipped_reason = "source already matches target format"
-        res.seconds = time.perf_counter() - start
-        return res
-    font: TTFont | None = None
-    try:
-        font = TTFont(str(src), lazy=True, recalcBBoxes=False, recalcTimestamp=False)
-        kind: str = _outline_kind(font)
-        if target in ("woff", "woff2"):
-            font.flavor = target
-        else:
-            if kind == "unknown":
-                res.skipped_reason = "no recognizable glyf/CFF outline table"
-                return res
-            needs_cff: bool = target == "otf"
-            if needs_cff and kind != "cff":
-                res.skipped_reason = (
-                    "source has TrueType (glyf) outlines; converting to .otf "
-                    "requires outline conversion, which is unsupported"
+                print(
+                    f"Warning: {p} does not match extensions {extensions}",
+                    file=sys.stderr,
                 )
-                return res
-            if not needs_cff and kind != "truetype":
-                res.skipped_reason = (
-                    "source has CFF outlines; converting to .ttf requires "
-                    "outline conversion, which is unsupported"
-                )
-                return res
-            font.flavor = None
-        font.save(str(dst))
-        res.dst = dst
-        res.dst_size = dst.stat().st_size
-        res.ok = True
-        if remove_src:
-            try:
-                src.unlink()
-                res.removed_src = True
-            except OSError as exc:
-                res.error = f"converted ok, but failed to remove source: {exc}"
-    except (TTLibError, OSError, Exception) as exc:
-        res.error = f"conversion failed: {exc}"
-        if dst.exists():
-            with contextlib.suppress(OSError):
-                dst.unlink()
-    finally:
-        if font is not None:
-            with contextlib.suppress(Exception):
-                font.close()
-        res.seconds = time.perf_counter() - start
-    return res
-
-
-def print_report(results: list[ConvResult]) -> None:
-    """Print a summary report of all conversion results."""
-    results.sort(key=lambda r: str(r.src))
-    name_w: int = min(max((len(r.src.name) for r in results), default=4), 40)
-    header: str = (
-        f"{'FILE':<{name_w}}  {'STATUS':<6}  {'SIZE (in->out)':<18}  "
-        f"{'RATIO':<7}  {'TIME':<7}  NOTE"
-    )
-    print(header)
-    print("-" * len(header))
-    ok: int = 0
-    skipped: int = 0
-    failed: int = 0
-    total_in: int = 0
-    total_out: int = 0
-    for r in results:
-        name: str = (
-            r.src.name if len(r.src.name) <= name_w else r.src.name[: name_w - 1] + "…"
-        )
-        if r.ok:
-            ok += 1
-            total_in += r.src_size
-            total_out += r.dst_size
-            ratio: float = (r.dst_size / r.src_size * 40) if r.src_size else 0.0
-            size_str: str = f"{fsz(r.src_size)}->{fsz(r.dst_size)}"
-            status: str = "OK*" if r.removed_src else "OK"
-            note: str = r.error or ""
-            print(
-                f"{name:<{name_w}}  {status:<6}  {size_str:<18}  "
-                f"{ratio:5.1f}%  {r.seconds:5.2f}s  {note}"
-            )
-        elif r.skipped_reason:
-            skipped += 1
-            print(
-                f"{name:<{name_w}}  {'SKIP':<6}  {'-':<18}  {'-':<7}  "
-                f"{r.seconds:5.2f}s  {r.skipped_reason}"
-            )
         else:
-            failed += 1
-            print(
-                f"{name:<{name_w}}  {'FAIL':<6}  {'-':<18}  {'-':<7}  "
-                f"{r.seconds:5.2f}s  {r.error}"
-            )
-    print("-" * len(header))
-    print(f"Total: {len(results)}  ok={ok}  skipped={skipped}  failed={failed}")
-    if total_in:
+            print(f"Warning: path not found: {p}", file=sys.stderr)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique: List[Path] = []
+    for f in result:
+        if f not in seen:
+            seen.add(f)
+            unique.append(f)
+    return unique
+
+
+def run_parallel(
+    func: Callable,
+    items: List,
+    workers: int,
+    *args,
+) -> List:
+    """Run func(item, *args) for each item, using a multiprocessing pool if workers > 1."""
+    if workers <= 1 or len(items) <= 1:
+        return [func(item, *args) for item in items]
+    with multiprocessing.Pool(processes=workers) as pool:
+        return pool.starmap(func, [(item, *args) for item in items])
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: convert (font_convert.py)
+# ---------------------------------------------------------------------------
+
+
+def _convert_worker(src: Path, target_ext: str, remove_source: bool) -> None:
+    """Convert a single font file to target format."""
+    if not HAS_FONTTOOLS:
         print(
-            f"Size:  {fsz(total_in)} -> {fsz(total_out)} "
-            f"({total_out / total_in * 40:.1f}% of original)"
+            "Error: fontTools is required for 'convert'. Install with: pip install fonttools",
+            file=sys.stderr,
         )
-    if any(r.removed_src for r in results):
-        print("(* = original file removed)")
+        return
+
+    flavor_map = {
+        "woff": "woff",
+        "woff2": "woff2",
+        "ttf": None,
+    }
+    flavor = flavor_map[target_ext]
+
+    dst = src.with_suffix(f".{target_ext}")
+    if dst.exists():
+        dst = unique_path(dst)
+
+    try:
+        font = TTFont(src)
+        font.flavor = flavor
+        font.save(dst)
+        print(f"{src.name} -> {dst.name}")
+        if remove_source and src.exists():
+            src.unlink()
+    except Exception as exc:
+        print(f"Error converting {src.name}: {exc}", file=sys.stderr)
+
+
+def cmd_convert(args: argparse.Namespace) -> int:
+    """Handler for 'convert' subcommand."""
+    if not HAS_FONTTOOLS:
+        print(
+            "Error: fontTools is required. Install with: pip install fonttools",
+            file=sys.stderr,
+        )
+        return 1
+
+    extensions = [".ttf", ".otf", ".woff", ".woff2"]
+    files = collect_files(args.paths, extensions)
+
+    # Filter out files already in the target format
+    target_suffix = f".{args.to}"
+    files = [f for f in files if f.suffix.lower() != target_suffix]
+
+    if not files:
+        print(f"No font files to convert to {target_suffix}", file=sys.stderr)
+        return 1
+
+    run_parallel(_convert_worker, files, args.workers, args.to, args.rm)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: otf2ttf (otf2ttf.py) — pure fontTools
+# ---------------------------------------------------------------------------
+
+
+def _otf2ttf_worker(src: Path, keep_source: bool) -> dict:
+    """Convert OTF to TTF using fontTools. Returns status dict."""
+    if not HAS_FONTTOOLS:
+        return {"status": "failed", "error": "fontTools not installed", "otf": str(src)}
+
+    dst = src.with_suffix(".ttf")
+    status = {"otf": str(src), "ttf": str(dst), "status": "unknown"}
+
+    if dst.exists():
+        status["status"] = "skipped_exists"
+        return status
+
+    try:
+        font = TTFont(src)
+        if "glyf" in font:
+            status["status"] = "skipped_already_ttf"
+            return status
+
+        cff_table = None
+        if "CFF2" in font:
+            cff_table = font["CFF2"]
+        elif "CFF " in font:
+            cff_table = font["CFF "]
+        else:
+            status["status"] = "failed_no_cff"
+            return status
+
+        glyph_order = font.getGlyphOrder()
+        for glyph_name in glyph_order:
+            if glyph_name in cff_table:
+                pen = TTGlyphPen(None)
+                cff_table[glyph_name].draw(pen)
+                font["glyf"][glyph_name] = pen.glyph()
+
+        font.flavor = None
+        for tag in ["CFF ", "CFF2", "VORG"]:
+            if tag in font:
+                del font[tag]
+
+        if "glyf" not in font:
+            raise ValueError("Failed to create glyf table")
+
+        font.sfVersion = "\x00\x01\x00\x00"
+        font.reader = None
+        font.save(dst)
+
+        if not keep_source:
+            src.unlink()
+
+        status["status"] = "success"
+    except Exception as exc:
+        status["status"] = "failed"
+        status["error"] = str(exc)
+        if dst.exists():
+            dst.unlink()
+
+    return status
+
+
+def cmd_otf2ttf(args: argparse.Namespace) -> int:
+    """Handler for 'otf2ttf' subcommand."""
+    if not HAS_FONTTOOLS:
+        print(
+            "Error: fontTools is required. Install with: pip install fonttools",
+            file=sys.stderr,
+        )
+        return 1
+
+    files = collect_files(args.paths, [".otf"])
+    if not files:
+        print("No OTF files found.", file=sys.stderr)
+        return 1
+
+    print(f"Found {len(files)} OTF file(s)")
+    print(f"Using {args.workers} worker processes")
+
+    results = run_parallel(_otf2ttf_worker, files, args.workers, args.keep_source)
+
+    summary = {
+        "total": len(results),
+        "success": 0,
+        "skipped_exists": 0,
+        "skipped_already_ttf": 0,
+        "failed": 0,
+    }
+    for res in results:
+        st = res["status"]
+        if st == "success":
+            summary["success"] += 1
+            print(
+                f"  ✓ Converted: {res['ttf']} (original {'kept' if args.keep_source else 'removed'})"
+            )
+        elif st == "skipped_exists":
+            summary["skipped_exists"] += 1
+            print(f"  ⚠ Skipped: {res['ttf']} (already exists)")
+        elif st == "skipped_already_ttf":
+            summary["skipped_already_ttf"] += 1
+            print(f"  ⚠ Skipped: {res['otf']} (already has TrueType outlines)")
+        else:
+            summary["failed"] += 1
+            err = res.get("error", "Unknown error")
+            print(f"  ✗ Failed: {res['otf']} — {err}")
+
+    print("\n" + "=" * 40)
+    print("Conversion Summary:")
+    print(f"  Total OTF files found: {summary['total']}")
+    print(f"  Successfully converted: {summary['success']}")
+    print(f"  Skipped (TTF exists): {summary['skipped_exists']}")
+    print(f"  Skipped (already TrueType): {summary['skipped_already_ttf']}")
+    print(f"  Failed: {summary['failed']}")
+    return 0 if summary["failed"] == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: otf2ttf-fontforge (otf_to_ttf.py)
+# ---------------------------------------------------------------------------
+
+
+def _otf2ttf_fontforge_worker(src: Path, keep_source: bool) -> Tuple[str, str]:
+    """Convert OTF to TTF using FontForge Python bindings. Returns (status, message)."""
+    try:
+        import fontforge
+    except ImportError:
+        return ("error", "FontForge Python module not available")
+
+    dst = src.with_suffix(".ttf")
+    if dst.exists():
+        return ("skipped", str(dst))
+
+    try:
+        font = fontforge.open(str(src))
+        font.generate(str(dst), flags=("opentype",))
+        font.close()
+        if not keep_source:
+            src.unlink()
+        return ("success", str(dst))
+    except Exception as exc:
+        return ("error", str(exc))
+
+
+def cmd_otf2ttf_fontforge(args: argparse.Namespace) -> int:
+    """Handler for 'otf2ttf-fontforge' subcommand."""
+    try:
+        import fontforge  # noqa: F401
+    except ImportError:
+        print("This script must be run with FontForge's Python interpreter:")
+        print("  fontforge-script font_toolkit.py otf2ttf-fontforge ...")
+        return 1
+
+    files = collect_files(args.paths, [".otf"])
+    if not files:
+        print("No OTF files found.", file=sys.stderr)
+        return 1
+
+    print(f"Found {len(files)} OTF file(s)\n")
+    summary = {"success": 0, "skipped": 0, "error": 0}
+    for src in files:
+        print(f"Processing: {src}")
+        status, msg = _otf2ttf_fontforge_worker(src, args.keep_source)
+        if status == "success":
+            print(
+                f"  ✓ Converted: {msg} (original {'kept' if args.keep_source else 'removed'})"
+            )
+            summary["success"] += 1
+        elif status == "skipped":
+            print(f"  ⚠ Skipped: {msg} (already exists)")
+            summary["skipped"] += 1
+        else:
+            print(f"  ✗ Failed: {msg}")
+            summary["error"] += 1
+
+    print(f"\n{'=' * 40}")
+    print(
+        f"Summary: {summary['success']} converted, {summary['skipped']} skipped, {summary['error']} failed"
+    )
+    return 0 if summary["error"] == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: tottf (tottf.py) — FontForge CLI
+# ---------------------------------------------------------------------------
+
+
+def _tottf_worker(src: Path, remove_source: bool) -> bool:
+    """Convert a font file to TTF using FontForge CLI. Returns True on success."""
+    dst = src.with_suffix(".ttf")
+    cmd = [
+        "fontforge",
+        "-lang=ff",
+        "-c",
+        '"Open($1); Generate($2);"',
+        str(src),
+        str(dst),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            print(f"✓ {src.name}")
+            if remove_source and src.exists():
+                src.unlink()
+            return True
+        else:
+            print(f"✘ {src.name}: {result.stderr.strip()}", file=sys.stderr)
+            return False
+    except Exception as exc:
+        print(f"Error processing {src.name}: {exc}", file=sys.stderr)
+        return False
+
+
+def cmd_tottf(args: argparse.Namespace) -> int:
+    """Handler for 'tottf' subcommand."""
+    extensions = [".svg", ".woff", ".eot", ".otf", ".ttc"]
+    files = collect_files(args.paths, extensions)
+    if not files:
+        print("No matching font files found.", file=sys.stderr)
+        return 1
+
+    success = 0
+    for src in files:
+        if src.suffix.lower() != ".ttf":
+            if _tottf_worker(src, args.remove_source):
+                success += 1
+
+    print(f"\nConverted {success}/{len(files)} files.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: woff22ttf (woff22ttf.py)
+# ---------------------------------------------------------------------------
+
+
+def _woff22ttf_worker(src: Path, keep_source: bool) -> bool:
+    """Decompress WOFF2 to TTF. Returns True on success."""
+    if not HAS_FONTTOOLS:
+        print(
+            "Error: fontTools is required. Install with: pip install fonttools",
+            file=sys.stderr,
+        )
+        return False
+
+    dst = src.with_suffix(".ttf")
+    if dst.exists() and dst.stat().st_size:
+        print(f"{src.name} already converted.")
+        return True
+
+    try:
+        woff2.decompress(str(src), str(dst))
+        print(f"{src.name} converted.")
+        if not keep_source:
+            src.unlink()
+        return True
+    except Exception as exc:
+        print(f"Error converting {src.name}: {exc}", file=sys.stderr)
+        return False
+
+
+def cmd_woff22ttf(args: argparse.Namespace) -> int:
+    """Handler for 'woff22ttf' subcommand."""
+    if not HAS_FONTTOOLS:
+        print(
+            "Error: fontTools is required. Install with: pip install fonttools",
+            file=sys.stderr,
+        )
+        return 1
+
+    files = collect_files(args.paths, [".woff2"])
+    if not files:
+        print("No WOFF2 files found.", file=sys.stderr)
+        return 1
+
+    print(f"Found {len(files)} WOFF2 file(s)")
+    run_parallel(_woff22ttf_worker, files, args.workers, args.keep_source)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI setup
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build and return the CLI argument parser."""
-    p: argparse.ArgumentParser = argparse.ArgumentParser(
-        prog="font_convert.py",
-        description="Convert TTF/OTF/WOFF/WOFF2 font files using fontTools.",
+    parser = argparse.ArgumentParser(
+        prog="font_toolkit.py",
+        description="Merged font conversion toolkit.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    p.add_argument(
-        "inputs",
-        nargs="*",
-        type=Path,
-        help=(
-            "Font files and/or directories (searched recursively). "
-            "Default: current directory, recursive."
-        ),
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # --- convert ---
+    p_convert = subparsers.add_parser(
+        "convert",
+        help="Convert TTF/OTF/WOFF/WOFF2 fonts to another container flavour.",
     )
-    p.add_argument(
-        "--to",
-        dest="target",
-        choices=sorted(VALID_TARGETS),
-        default="woff2",
-        help="Output format (default: woff2).",
+    p_convert.add_argument(
+        "paths", nargs="*", help="Font files or directories (default: scan cwd)"
     )
-    p.add_argument(
+    p_convert.add_argument(
+        "--to", required=True, choices=["ttf", "woff", "woff2"], help="Target format"
+    )
+    p_convert.add_argument(
         "-r",
-        "--remove",
-        default=True,
+        "--rm",
         action="store_true",
-        help="Delete the original file after a successful conversion.",
+        help="Delete source file after successful conversion",
     )
-    return p
+    p_convert.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers (default: 4)",
+    )
+    p_convert.set_defaults(func=cmd_convert)
+
+    # --- otf2ttf ---
+    p_otf2ttf = subparsers.add_parser(
+        "otf2ttf",
+        help="Convert OTF to TTF using fontTools (pure Python).",
+    )
+    p_otf2ttf.add_argument(
+        "paths", nargs="*", help="OTF files or directories (default: scan cwd)"
+    )
+    p_otf2ttf.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=6,
+        help="Number of parallel workers (default: 6)",
+    )
+    p_otf2ttf.add_argument(
+        "-k",
+        "--keep-source",
+        action="store_true",
+        help="Keep original OTF files (default: remove)",
+    )
+    p_otf2ttf.set_defaults(func=cmd_otf2ttf)
+
+    # --- otf2ttf-fontforge ---
+    p_otf2ttf_ff = subparsers.add_parser(
+        "otf2ttf-fontforge",
+        help="Convert OTF to TTF using FontForge Python bindings.",
+    )
+    p_otf2ttf_ff.add_argument(
+        "paths", nargs="*", help="OTF files or directories (default: scan cwd)"
+    )
+    p_otf2ttf_ff.add_argument(
+        "-k",
+        "--keep-source",
+        action="store_true",
+        help="Keep original OTF files (default: remove)",
+    )
+    p_otf2ttf_ff.set_defaults(func=cmd_otf2ttf_fontforge)
+
+    # --- tottf ---
+    p_tottf = subparsers.add_parser(
+        "tottf",
+        help="Convert SVG/WOFF/EOT/OTF/TTC to TTF using FontForge CLI.",
+    )
+    p_tottf.add_argument(
+        "paths", nargs="*", help="Font files or directories (default: scan cwd)"
+    )
+    p_tottf.add_argument(
+        "-r",
+        "--remove-source",
+        action="store_true",
+        help="Delete source file after successful conversion",
+    )
+    p_tottf.set_defaults(func=cmd_tottf)
+
+    # --- woff22ttf ---
+    p_woff22 = subparsers.add_parser(
+        "woff22ttf",
+        help="Decompress WOFF2 to TTF using fontTools.",
+    )
+    p_woff22.add_argument(
+        "paths", nargs="*", help="WOFF2 files or directories (default: scan cwd)"
+    )
+    p_woff22.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers (default: 4)",
+    )
+    p_woff22.add_argument(
+        "-k",
+        "--keep-source",
+        action="store_true",
+        help="Keep original WOFF2 files (default: remove)",
+    )
+    p_woff22.set_defaults(func=cmd_woff22ttf)
+
+    return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point. Parse args, convert fonts, print report, return exit code."""
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    raw_inputs: list[Path] = [p.resolve() for p in args.inputs or [Path(".")]]
-    missing: list[Path] = [p for p in raw_inputs if not p.exists()]
-    if missing:
-        for p in missing:
-            logger.error(f"path not found: {p}")
-        return 2
-    files: list[Path] = iter_font_files(raw_inputs)
-    already_target: list[Path] = [
-        f for f in files if f.suffix.lower().lstrip(".") == args.target
-    ]
-    if already_target:
-        print(
-            f"Skipping {len(already_target)} file(s) already in .{args.target} format."
-        )
-    files = [f for f in files if f not in already_target]
-    if not files:
-        print("No convertible font files found.")
-        return 0
-    print(
-        f"Converting {len(files)} file(s) -> .{args.target} with "
-        f"{POOL_SIZE} worker(s)...\n"
-    )
-    results: list[ConvResult] = []
-    with Pool(processes=POOL_SIZE) as pool:
-        async_results = [
-            pool.apply_async(convert_one, (f, args.target, args.remove)) for f in files
-        ]
-        for ar in async_results:
-            results.append(ar.get())
-    print_report(results)
-    failed: int = sum(1 for r in results if not r.ok and not r.skipped_reason)
-    return 1 if failed else 0
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nConversion interrupted by user.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

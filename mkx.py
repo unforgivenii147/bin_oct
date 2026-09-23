@@ -1,154 +1,136 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-"""Make files executable when they match conventional executable criteria under CWD.
+"""
+mkx.py — make files in the current directory tree executable.
 
-Regenerate this script: walk CWD with pathlib, skip symlinks and .git, and for each regular file that is
-not already executable, set the executable bits when it lives in sbin/bin/.bin, matches *.so(.\d+)*,
-starts with a shebang, or has no extension and is detected as binary via dh.is_binary; use a fixed
-8-worker multiprocessing Pool selected by --pool-method (map, starmap, imap_unordered, apply_async)
-and log changes with loguru.
+Behaviors merged from two original scripts and applied in a single pass:
+  * suffix mode (from make_executable.py): files whose suffix is in
+    {.py,.sh,.bash,.pl,.rb,.pyw,.txt}, or files with no suffix, AND that
+    start with a shebang ("#!").
+  * heuristic mode (from mkx.py): files inside a bin/sbin/.bin directory,
+    *.so* libraries, shebang files, or binary files with no suffix.
+
+Runs recursively from the current working directory, updates in place,
+skips .git and symlinks, uses a fixed 8-worker multiprocessing pool.
+
+Usage:
+    python mkx.py
 """
 
-from __future__ import annotations
-
-import argparse
+import multiprocessing as mp
+import os
 import re
-import stat
-from collections.abc import Sequence
-from multiprocessing.pool import AsyncResult, Pool
 from pathlib import Path
-from typing import Final
 
-from dh import is_binary  # type: ignore[import-untyped]
-from loguru import logger
-
-POOL_WORKERS: Final[int] = 8
-POOL_METHODS: Final[tuple[str, ...]] = (
-    "map",
-    "starmap",
-    "imap_unordered",
-    "apply_async",
-)
-
-EXEC_DIRS: Final[frozenset[str]] = frozenset({"sbin", "bin", ".bin"})
-SHARED_OBJECT_RE: Final[re.Pattern[str]] = re.compile(r".*\.so(?:\.\d+)*$")
+SUFFIXES = {".py", ".sh", ".bash", ".pl", ".rb", ".pyw", ".txt"}
+BIN_DIRS = {"sbin", "bin", ".bin"}
+SO_RE = re.compile(r".*\.so(?:\.\d+)*$")
+WORKERS = 8
 
 
-def has_shebang(path: Path) -> bool:
-    """Return True when *path* begins with ``#!``."""
+def has_shebang(p):
     try:
-        with path.open("rb") as f:
+        with p.open("rb") as f:
             return f.read(2) == b"#!"
-    except (OSError, PermissionError):
-        return False
-
-
-def is_shared_object(path: Path) -> bool:
-    """Return True when *path* looks like a shared object (``*.so`` with optional version)."""
-    return SHARED_OBJECT_RE.match(path.name) is not None
-
-
-def make_exec(path: Path) -> None:
-    """Add user/group/other execute bits to *path*."""
-    try:
-        current = path.stat().st_mode
-        path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    except OSError as exc:
-        logger.debug(f"Could not chmod {path}: {exc}")
-
-
-def is_exec(path: Path) -> bool:
-    """Return True when *path* has the user-execute bit set."""
-    try:
-        return bool(path.stat().st_mode & stat.S_IXUSR)
     except OSError:
         return False
 
 
-def should_be_executable(path: Path) -> bool:
-    """Return True when *path* matches one of the executable heuristic rules."""
-    if path.parent.name in EXEC_DIRS:
+def is_binary(p):
+    try:
+        with p.open("rb") as f:
+            return b"\x00" in f.read(8192)
+    except OSError:
+        return False
+
+
+def is_executable(p):
+    try:
+        return bool(p.stat().st_mode & 0o100)
+    except OSError:
+        return False
+
+
+def chmod_x(p):
+    try:
+        p.chmod(p.stat().st_mode | 0o111)
         return True
-    if is_shared_object(path):
+    except OSError:
+        return False
+
+
+def should_execute(p):
+    """Union of both original selection rules."""
+    # suffix-mode rule: whitelisted suffix (or none) + shebang
+    if has_shebang(p):
         return True
-    if has_shebang(path):
+    # heuristic-mode rules
+    if p.parent.name in BIN_DIRS:
         return True
-    return bool(not path.suffix and is_binary(path))
+    if SO_RE.match(p.name):
+        return True
+    if not p.suffix and is_binary(p):
+        return True
+    return False
 
 
-def process_file(path: Path, cwd: Path) -> str | None:
-    """Make *path* executable if eligible; return a status message or ``None``."""
-    if path.is_file() and not is_exec(path) and should_be_executable(path):
-        make_exec(path)
-        return f"[+] Made executable: {path.relative_to(cwd)}"
-    return None
+def process(path_str):
+    """Worker. Returns (path_str, changed, error)."""
+    p = Path(path_str)
+    try:
+        if not p.is_file():
+            return path_str, False, None
+        if is_executable(p):
+            return path_str, False, None
+        if not should_execute(p):
+            return path_str, False, None
+        if os.name != "posix":
+            return path_str, False, None
+        if chmod_x(p):
+            return path_str, True, None
+        return path_str, False, "chmod failed"
+    except Exception as e:
+        return path_str, False, str(e)
 
 
-def _process_file_tuple(task: tuple[Path, Path]) -> str | None:
-    """Tuple-argument wrapper around :func:`process_file` for ``Pool.map``."""
-    path, cwd = task
-    return process_file(path, cwd)
+def main():
+    root = Path.cwd()
+    self_path = Path(__file__).resolve()
 
-
-def _run_pool(tasks: Sequence[tuple[Path, Path]], method: str) -> list[str | None]:
-    """Process *tasks* with a fixed 8-worker Pool using *method*."""
-    with Pool(processes=POOL_WORKERS) as pool:
-        if method == "map":
-            return pool.map(_process_file_tuple, tasks)
-
-        if method == "starmap":
-            return pool.starmap(process_file, tasks)
-
-        if method == "imap_unordered":
-            return list(pool.imap_unordered(_process_file_tuple, tasks))
-
-        if method == "apply_async":
-            async_results: list[AsyncResult[str | None]] = [
-                pool.apply_async(_process_file_tuple, (task,)) for task in tasks
-            ]
-            return [result.get() for result in async_results]
-
-    raise ValueError(f"Unsupported pool method: {method}")
-
-
-def process_directory(cwd: Path, pool_method: str = "map") -> None:
-    """Make eligible files under *cwd* executable and log each change."""
-    files: list[Path] = [
-        p
-        for p in cwd.rglob("*")
-        if p.is_file() and ".git" not in p.parts and not p.is_symlink()
-    ]
+    files = []
+    for p in root.rglob("*"):
+        if ".git" in p.parts:
+            continue
+        if p.is_symlink():
+            continue
+        try:
+            if p.resolve() == self_path:
+                continue
+        except OSError:
+            pass
+        if p.is_file():
+            files.append(str(p))
 
     if not files:
-        logger.info("No files to process.")
-        return
+        print("No files found.")
+        return 0
 
-    tasks: list[tuple[Path, Path]] = [(f, cwd) for f in files]
-    results = _run_pool(tasks, pool_method)
+    changed = errors = 0
+    with mp.Pool(processes=WORKERS) as pool:
+        results = [pool.apply_async(process, (f,)) for f in files]
+        for r in results:
+            path_str, did_change, err = r.get()
+            if err:
+                errors += 1
+                print(f"ERROR {path_str}: {err}")
+                continue
+            if did_change:
+                changed += 1
+                print(f"[+] Made executable: {path_str}")
 
-    for result in results:
-        if result:
-            logger.info(result)
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--pool-method",
-        choices=POOL_METHODS,
-        default="map",
-        help="Multiprocessing pool method to use for processing.",
-    )
-    return parser.parse_args()
-
-
-def main() -> int:
-    """CLI entry point."""
-    args: argparse.Namespace = parse_args()
-    pool_method: str = args.pool_method
-
-    process_directory(Path.cwd(), pool_method)
-    return 0
+    print(f"Done. changed={changed} errors={errors}")
+    if os.name != "posix":
+        print("Note: non-POSIX system — executable bits not applied.")
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

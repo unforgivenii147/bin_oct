@@ -1,111 +1,191 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 """
-Search PyPI packages by name (case-insensitive substring match) in a CSV file.
+Search PyPI packages by name (case-insensitive substring) using SQLite FTS5.
 
-CSV format expected:   name,downloads
-one record per line.
+Data flow:
+  /sdcard/data/pip.db   --  prebuilt SQLite database (read-only)
 
-The file is scanned through mmap in parallel. Each worker gets a byte range,
-aligns it to record boundaries, and returns its matches. The main process
-merges and sorts by downloads descending.
+The script auto-detects the table name and column names at runtime.
+It assumes the table has exactly two columns: the first is the package
+name (searchable), the second is the download count (sortable).
+
+Why FTS5 with the trigram tokenizer?
+  A plain SQLite table with `LIKE '%foo%'` still does a full table scan.
+  The trigram tokenizer builds an inverted index of 3-character substrings,
+  so a query like "pand" becomes a small B-tree intersection -- O(matches)
+  instead of O(rows). This is what makes SQLite beat the mmap/CSV approach
+  by an order of magnitude for substring search.
+
+Why heapq.nlargest?
+  For a broad keyword (e.g. "py") FTS5 may return tens of thousands of rows.
+  Sorting the full list with `list.sort` is O(k log k) time and O(k) memory.
+  `heapq.nlargest` streams the SQLite cursor through a size-`limit` min-heap,
+  giving O(k log limit) time and O(limit) extra memory. It never materialises
+  the full result set.
+
+Usage:
+  search pandas                 # top 20 substring matches by downloads
+  search -n 100 pandas          # top 100
 """
 
-import mmap
-import multiprocessing as mp
-import os
+import argparse
+import heapq
+import sqlite3
 import sys
 from pathlib import Path
 
-CSV_PATH = Path("/sdcard/data/pip.csv")
+DB_PATH = Path("/sdcard/data/pip.db")
 
-# Don't spawn a pool for tiny files — IPC overhead dominates.
-PARALLEL_MIN_BYTES = 4 * 1024 * 1024  # 4 MiB
-MAX_WORKERS = 8  # 8-core phone
-
-
-def _scan_range(args):
-    """Worker: scan bytes [start, end) of the file, return [(name, dl), ...]."""
-    path, start, end, kw = args
-    matches = []
-
-    with open(path, "rb") as f:
-        size = os.fstat(f.fileno()).st_size
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            # Align start forward to the next record boundary.
-            if start > 0:
-                nl = mm.find(b"\n", start)
-                if nl == -1:
-                    return matches
-                start = nl + 1
-
-            # Align end forward past the current record (so it isn't split).
-            if end < size:
-                nl = mm.find(b"\n", end)
-                end = size if nl == -1 else nl + 1
-
-            if start >= end:
-                return matches
-
-            # Copy the slice into a plain bytes object so the mmap can close.
-            chunk = mm[start:end]
-
-    for line in chunk.split(b"\n"):
-        if not line:
-            continue
-        comma = line.find(b",")
-        if comma <= 0:
-            continue
-        name = line[:comma]
-        if kw in name.lower():
-            try:
-                dl = int(line[comma + 1 :])
-            except ValueError:
-                continue
-            matches.append((name.decode("utf-8"), dl))
-
-    return matches
+DEFAULT_LIMIT = 20
+TRIGRAM_MIN = 3  # FTS5 trigram cannot index/query strings shorter than 3 chars
 
 
-def _split_ranges(path, n):
-    size = os.path.getsize(path)
-    step = size // n
-    ranges = []
-    for i in range(n):
-        start = i * step
-        end = size if i == n - 1 else (i + 1) * step
-        ranges.append((str(path), start, end))
-    return ranges
+# ----------------------------------------------------------- introspection ---
 
 
-def main():
-    if len(sys.argv) > 1:
-        keyword = sys.argv[1]
+def get_table_info(con: sqlite3.Connection):
+    """
+    Discover the table name, the name column, the downloads column, and
+    whether the table is an FTS5 virtual table.
+
+    Returns:
+        (table, name_col, dl_col, is_fts5)
+    """
+    # Find all user tables (exclude SQLite internal ones)
+    cur = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    )
+    tables = [row[0] for row in cur.fetchall()]
+    if not tables:
+        sys.exit("No tables found in database.")
+
+    # Prefer a table with exactly two columns
+    chosen = None
+    for t in tables:
+        cur = con.execute(f'PRAGMA table_info("{t}")')
+        cols = cur.fetchall()
+        if len(cols) == 2:
+            chosen = (t, [c[1] for c in cols])
+            break
+
+    if chosen is None:
+        # Fallback: take the first table and hope it has at least two columns
+        t = tables[0]
+        cur = con.execute(f'PRAGMA table_info("{t}")')
+        cols = [c[1] for c in cur.fetchall()]
+        if len(cols) < 2:
+            sys.exit(f"Table '{t}' must have at least two columns.")
+        chosen = (t, cols)
+
+    table, col_names = chosen
+    name_col, dl_col = col_names[0], col_names[1]
+
+    # Is it an FTS5 virtual table?
+    cur = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    row = cur.fetchone()
+    is_fts5 = bool(row and row[0] and "fts5" in row[0].lower())
+
+    return table, name_col, dl_col, is_fts5
+
+
+# --------------------------------------------------------------- search ---
+
+
+def search(
+    con: sqlite3.Connection,
+    table: str,
+    name_col: str,
+    dl_col: str,
+    is_fts5: bool,
+    keyword: str,
+    limit: int,
+):
+    """
+    Return the top `limit` matches as a list of (name, downloads) tuples,
+    sorted by downloads descending.
+
+    Uses FTS5 MATCH for keywords of length >= 3 when the table is FTS5.
+    Falls back to LIKE for shorter keywords or non-FTS5 tables.
+    """
+    kw = keyword.lower()
+
+    # Quote identifiers to be safe with any names
+    q_table = f'"{table}"'
+    q_name = f'"{name_col}"'
+    q_dl = f'"{dl_col}"'
+
+    def run_like():
+        # Escape the LIKE metacharacters (\ % _) so "a_b" is literal.
+        escaped = kw.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        sql = (
+            f"SELECT {q_name}, {q_dl} FROM {q_table} WHERE {q_name} LIKE ? ESCAPE '\\'"
+        )
+        return con.execute(sql, (f"%{escaped}%",))
+
+    cur = None
+    if is_fts5 and len(kw) >= TRIGRAM_MIN:
+        # Double-quote the keyword so FTS5 treats it as a literal phrase
+        # rather than interpreting MATCH operators (AND, OR, NEAR, *, etc.).
+        # Inner double quotes are escaped by doubling them, per FTS5 rules.
+        fts_query = '"' + kw.replace('"', '""') + '"'
+        sql = f"SELECT {q_name}, {q_dl} FROM {q_table} WHERE {q_name} MATCH ?"
+        try:
+            cur = con.execute(sql, (fts_query,))
+        except sqlite3.OperationalError:
+            # Fallback: e.g. the column is UNINDEXED in FTS5, or MATCH failed
+            cur = run_like()
     else:
+        cur = run_like()
+
+    # Streaming top-N: the cursor is consumed lazily, one row at a time,
+    # and only a size-`limit` heap is retained.
+    return heapq.nlargest(limit, cur, key=lambda r: r[1])
+
+
+# ----------------------------------------------------------------- main ---
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Search PyPI packages by substring (SQLite FTS5 trigram).",
+    )
+    ap.add_argument(
+        "keyword", nargs="?", help="substring to search for (case-insensitive)"
+    )
+    ap.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"max results (default: {DEFAULT_LIMIT})",
+    )
+    args = ap.parse_args()
+
+    if not DB_PATH.exists():
+        sys.exit(f"Index not found: {DB_PATH}")
+
+    keyword = args.keyword
+    if not keyword:
         keyword = input("Search package: ").strip()
         if not keyword:
             print("No keyword given.")
             return
 
-    kw = keyword.lower().encode()
+    con = sqlite3.connect(str(DB_PATH))
+    try:
+        table, name_col, dl_col, is_fts5 = get_table_info(con)
+        rows = search(con, table, name_col, dl_col, is_fts5, keyword, args.limit)
+    finally:
+        con.close()
 
-    size = os.path.getsize(CSV_PATH)
-    workers = min(mp.cpu_count(), MAX_WORKERS)
-
-    if size < PARALLEL_MIN_BYTES or workers <= 1:
-        matches = _scan_range((str(CSV_PATH), 0, size, kw))
-    else:
-        tasks = [(p, s, e, kw) for (p, s, e) in _split_ranges(CSV_PATH, workers)]
-        # fork (Linux/Android default) is fastest here — no re-import.
-        with mp.Pool(workers) as pool:
-            results = pool.map(_scan_range, tasks)
-        matches = [item for sub in results for item in sub]
-
-    if not matches:
+    if not rows:
         print(f"No matches for '{keyword}'.")
         return
 
-    matches.sort(key=lambda x: x[1], reverse=True)
-    for name, dl in matches:
+    for name, dl in rows:
         print(f"{name}  {dl}")
 
 

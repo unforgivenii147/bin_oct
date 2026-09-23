@@ -4,10 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dh import get_files, mpf
+from dh import get_files
 from docutils.core import publish_parts
-
-MAX_WORKERS = 4
 
 
 def rst_to_html(content: str) -> str:
@@ -44,7 +42,8 @@ def main() -> None:
     if len(files) == 1:
         process_file(files[0])
         sys.exit(1)
-    mpf(process_file, files)
+    for f in files:
+        process_file(f)
 
 
 if __name__ == "__main__":

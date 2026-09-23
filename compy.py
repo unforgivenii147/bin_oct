@@ -1082,7 +1082,7 @@ def main() -> int:
     prompt_content = prompt_path.read_text(encoding="utf-8")
     append_text(OUTPUT_FILE, prompt_content)
     content = OUTPUT_FILE.read_text(encoding="utf-8")
-    cmd = ["termux_clipboard_set", content]
+    cmd = ["termux-clipboard-set", content]
     runcmd(cmd, show_output=True)
     print(f"Wrote to {OUTPUT_FILE}")
 
