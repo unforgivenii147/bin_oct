@@ -1,33 +1,4 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-"""Initialize a new Python project in ./<pkgname>, init git, and push to GitHub.
-
-Two project layouts are supported:
-
-    Package layout (default)
-        src-layout package with cli/utils/logging/credentials modules,
-        a ``__main__.py``, and a console-script entry point.
-
-    Single-file layout (``-s`` / ``--single-file``)
-        A single ``<pkgname>.py`` module at the project root with an
-        optional ``main()`` entry point. No ``src/`` directory, no
-        submodules, no ``py.typed``.
-
-Both layouts produce a project with:
-
-    - pyproject.toml, setup.py, setup.cfg, README.md, .gitignore
-    - a fresh git repo, an initial commit, and a GitHub remote
-
-Existing files and directories are never overwritten: the script only
-creates entries that are missing.
-
-Requires:
-    - python-dotenv (``pip install python-dotenv``)
-    - GITHUB_TOKEN in ~/.env
-    - git installed and ``user.name`` / ``user.email`` configured
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -54,7 +25,7 @@ DEFAULT_BRANCH: Final[str] = "main"
 """Branch name used for the initial commit and remote tracking."""
 
 VERSION: Final[str] = "1.4.7"
-"""Version stamped into pyproject.toml and __init__.py / <pkgname>.py."""
+"""Version stamped into pyproject.toml, __init__.py, <pkgname>.py, <pkgname>.pyx."""
 
 
 # Load .env early so GITHUB_TOKEN is available to any subsequent code.
@@ -100,6 +71,8 @@ site/
 
 # setup.py is a minimal shim: all metadata lives in pyproject.toml.
 # It exists for tools / workflows that still expect a setup.py to be present.
+# NOTE: the Cython layout uses a *different* setup.py (see
+# SETUP_PY_CYTHON_TMPL below) because it must declare ``ext_modules``.
 SETUP_PY: Final[str] = '''\
 """Legacy shim for tools that still expect a setup.py.
 
@@ -114,12 +87,18 @@ setup()
 
 # --------------------------------------------------------------------------- #
 # File templates -- package layout
+#
+# The src-layout package contains only two modules:
+#   * __init__.py -- package version marker
+#   * cli.py      -- Typer application and console entry point
+# All other helpers (credentials, logging, utils, __main__, py.typed) were
+# intentionally dropped: they can be added back by the user on demand.
 # --------------------------------------------------------------------------- #
 
 PYPROJECT_PKG_TMPL: Final[str] = """\
 [build-system]
 requires = ["setuptools"]
-build-backend = "setuptools.buildmeta"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "{pkgname}"
@@ -128,16 +107,10 @@ readme = "README.md"
 authors = [
   {{name = "isaac onagh", email = "mkalafsaz@gmail.com"}}
 ]
-classifiers = [
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Typing :: Typed",
-]
-license = "MIT"
 requires-python = ">= 3.12"
 
 [project.scripts]
-{pkgname} = "{pkgname}.cli:app"
+{pkgname} = "{pkgname}.cli:main"
 """
 
 SETUP_CFG_PKG_TMPL: Final[str] = """\
@@ -146,17 +119,10 @@ package_dir =
     = src
 packages = find:
 python_requires = >= 3.12
-install_requires =
-    typer
-    rich
-    loguru
-    python-dotenv
 
 [options.packages.find]
 where = src
 
-[options.package_data]
-* = py.typed
 
 [mypy]
 python_version = 3.12
@@ -167,7 +133,7 @@ warn_unreachable = True
 files = src
 
 [ruff]
-line-length = 88
+line-length = 120
 target-version = py312
 
 [tool:pytest]
@@ -177,18 +143,9 @@ addopts = -ra -q
 
 INIT_PY_TMPL: Final[str] = '__version__ = "{version}"\n'
 
-MAIN_PY: Final[str] = """\
-from .cli import app
-
-if __name__ == "__main__":
-    app()
-"""
-
 CLI_PY_TMPL: Final[str] = """\
 import typer
 from rich.console import Console
-
-from {pkgname} import utils
 
 app = typer.Typer()
 console = Console()
@@ -199,50 +156,10 @@ def main() -> None:
     console.print(
         "Replace this message by putting your code into {pkgname}.cli.main"
     )
-    utils.do_something_useful()
 
 
 if __name__ == "__main__":
     app()
-"""
-
-CREDENTIALS_PY: Final[str] = """\
-import json
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-dotenv_path = Path(__file__).parent.parent / ".env"
-load_dotenv(dotenv_path=dotenv_path)
-"""
-
-LOGGING_PY: Final[str] = """\
-from sys import stdout
-
-from loguru import logger
-
-log_handler_id: int | None = None
-
-
-def set_logger_level(level: str | int):
-    global log_handler_id
-    logger.remove(log_handler_id)
-    log_handler_id = logger.add(sink=stdout, level=level)
-
-
-def main():
-    logger.remove()
-    log_handler_id = logger.add(sink=stdout)
-
-
-if __name__ == "__main__":
-    main()
-"""
-
-UTILS_PY: Final[str] = """\
-def do_something_useful() -> None:
-    print("Replace this with a utility function")
 """
 
 
@@ -253,7 +170,7 @@ def do_something_useful() -> None:
 PYPROJECT_SINGLE_TMPL: Final[str] = """\
 [build-system]
 requires = ["setuptools"]
-build-backend = "setuptools.buildmeta"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "{pkgname}"
@@ -262,12 +179,6 @@ readme = "README.md"
 authors = [
   {{name = "isaac onagh", email = "mkalafsaz@gmail.com"}}
 ]
-classifiers = [
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Typing :: Typed",
-]
-license = "MIT"
 requires-python = ">= 3.12"
 
 [project.scripts]
@@ -289,7 +200,7 @@ warn_unreachable = True
 files = {pkgname}.py
 
 [ruff]
-line-length = 88
+line-length = 120
 target-version = py312
 
 [tool:pytest]
@@ -312,6 +223,93 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+'''
+
+
+# --------------------------------------------------------------------------- #
+# File templates -- Cython layout
+#
+# A Cython project is a *single extension module* named <pkgname> built from
+# one <pkgname>.pyx source file at the project root. It looks like the
+# single-file layout from the user's point of view, but differs in two ways:
+#
+#   1. build-system requires "Cython" in addition to "setuptools".
+#   2. setup.py is *required* (not a legacy shim) because setuptools must be
+#      told about the Extension via ``ext_modules`` -- there is no
+#      declarative equivalent in pyproject.toml / setup.cfg.
+# --------------------------------------------------------------------------- #
+
+PYPROJECT_CYTHON_TMPL: Final[str] = """\
+[build-system]
+requires = ["setuptools", "Cython"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{pkgname}"
+version = "{version}"
+readme = "README.md"
+authors = [
+  {{name = "isaac onagh", email = "mkalafsaz@gmail.com"}}
+]
+requires-python = ">= 3.12"
+
+[project.scripts]
+{pkgname} = "{pkgname}:main"
+"""
+
+SETUP_CFG_CYTHON_TMPL: Final[str] = """\
+[options]
+python_requires = >= 3.12
+install_requires =
+
+[ruff]
+line-length = 120
+target-version = py312
+
+[tool:pytest]
+testpaths = tests
+addopts = -ra -q
+"""
+
+# Required (unlike the other layouts): setuptools needs ``ext_modules``,
+# which cannot be expressed declaratively in pyproject.toml / setup.cfg.
+SETUP_PY_CYTHON_TMPL: Final[str] = '''\
+"""Build configuration for the Cython extension module ``{pkgname}``.
+
+Unlike the pure-Python layouts, this file is *required*: setuptools must be
+told about the C extension via ``ext_modules``, which has no declarative
+equivalent in ``pyproject.toml`` / ``setup.cfg``. All other project metadata
+still lives in ``pyproject.toml`` and ``setup.cfg``.
+"""
+
+from setuptools import Extension, setup
+from Cython.Build import cythonize
+
+# ``Extension("<name>", ["<src>"])`` builds ``{pkgname}`` from the single
+# Cython source file ``{pkgname}.pyx`` at the project root. Language level 3
+# is the recommended default for Python 3-only code.
+extensions = [
+    Extension("{pkgname}", ["{pkgname}.pyx"]),
+]
+
+setup(
+    ext_modules=cythonize(
+        extensions,
+        compiler_directives={{"language_level": "3"}},
+    ),
+)
+'''
+
+CYTHON_PYX_TMPL: Final[str] = '''\
+# cython: language_level=3
+"""{pkgname} -- a Cython extension module."""
+
+__version__ = "{version}"
+
+
+def main() -> None:
+    """Console-script entry point for the ``{pkgname}`` command."""
+    print("Hello from {pkgname}")
 '''
 
 
@@ -472,6 +470,16 @@ def get_or_create_github_repo(
 def render_package_files(pkgname: str) -> dict[Path, str]:
     """Return path -> content for the default src-layout package.
 
+    The generated package contains exactly two modules inside
+    ``src/<pkgname>/``:
+
+    * ``__init__.py`` -- exposes ``__version__``.
+    * ``cli.py``      -- Typer application and console entry point.
+
+    No ``__main__.py``, ``credentials.py``, ``logging.py``, ``utils.py`` or
+    ``py.typed`` marker are emitted; add them yourself if your project needs
+    them.
+
     Args:
         pkgname: The Python package name (also used as the project directory).
 
@@ -489,12 +497,7 @@ def render_package_files(pkgname: str) -> dict[Path, str]:
         Path("setup.py"): SETUP_PY,
         Path("setup.cfg"): SETUP_CFG_PKG_TMPL,
         src_pkg / "__init__.py": INIT_PY_TMPL.format(version=VERSION),
-        src_pkg / "__main__.py": MAIN_PY,
         src_pkg / "cli.py": CLI_PY_TMPL.format(pkgname=pkgname),
-        src_pkg / "credentials.py": CREDENTIALS_PY,
-        src_pkg / "logging.py": LOGGING_PY,
-        src_pkg / "utils.py": UTILS_PY,
-        src_pkg / "py.typed": "",
     }
 
 
@@ -526,9 +529,52 @@ def render_single_file_files(pkgname: str) -> dict[Path, str]:
     }
 
 
-def init_project(
-    pkgname: str, *, single_file: bool
-) -> tuple[Path, list[Path], list[Path]]:
+def render_cython_files(pkgname: str) -> dict[Path, str]:
+    """Return path -> content for the Cython extension-module layout.
+
+    The layout mirrors the single-file layout (one module at the project
+    root, no ``src/`` directory, no submodules), but the module is a Cython
+    ``<pkgname>.pyx`` source file that is compiled into a native extension.
+
+    Two consequences of being a compiled extension:
+
+    * ``setup.py`` is *required* (not the legacy shim) because setuptools
+      needs ``ext_modules`` to know how to build the extension; there is no
+      declarative way to express this in pyproject.toml / setup.cfg.
+    * ``pyproject.toml`` lists ``Cython`` in ``build-system.requires`` so a
+      PEP 517 build fetches the compiler frontend on demand.
+
+    Args:
+        pkgname: The Cython module name (also used as the project directory).
+
+    Returns:
+        A dictionary whose keys are project-relative ``Path`` objects and
+        whose values are the text content to write into each file.
+    """
+    return {
+        Path(".gitignore"): GITIGNORE,
+        Path("README.md"): f"# {pkgname}\n",
+        Path("pyproject.toml"): PYPROJECT_CYTHON_TMPL.format(
+            pkgname=pkgname, version=VERSION
+        ),
+        Path("setup.py"): SETUP_PY_CYTHON_TMPL.format(pkgname=pkgname),
+        Path("setup.cfg"): SETUP_CFG_CYTHON_TMPL,
+        Path(f"{pkgname}.pyx"): CYTHON_PYX_TMPL.format(
+            pkgname=pkgname, version=VERSION
+        ),
+    }
+
+
+# Layout identifiers accepted by ``init_project``. ``layout`` is a plain
+# string rather than a bool pair because the three options are mutually
+# exclusive (enforced at the argparse layer) and a string keeps the dispatch
+# table explicit.
+LAYOUT_PACKAGE: Final[str] = "package"
+LAYOUT_SINGLE: Final[str] = "single"
+LAYOUT_CYTHON: Final[str] = "cython"
+
+
+def init_project(pkgname: str, *, layout: str) -> tuple[Path, list[Path], list[Path]]:
     """Create the project directory tree, writing only missing files.
 
     Existing files and directories are preserved: this function never
@@ -536,23 +582,31 @@ def init_project(
 
     Args:
         pkgname: The Python package / module name.
-        single_file: If True, use the single-file layout; otherwise use the
-            default src-layout package.
+        layout: One of ``LAYOUT_PACKAGE`` (src-layout pure-Python package),
+            ``LAYOUT_SINGLE`` (single-file ``<pkgname>.py`` module), or
+            ``LAYOUT_CYTHON`` (single-file ``<pkgname>.pyx`` Cython
+            extension).
 
     Returns:
         A tuple ``(root, created, skipped)`` where ``root`` is the absolute
         path to the project directory, ``created`` is a list of newly
         written file paths, and ``skipped`` is a list of pre-existing paths
         that were left untouched.
+
+    Raises:
+        ValueError: If ``layout`` is not one of the recognised identifiers.
     """
     root: Path = Path.cwd() / pkgname
     root.mkdir(parents=True, exist_ok=True)
 
-    files: dict[Path, str] = (
-        render_single_file_files(pkgname)
-        if single_file
-        else render_package_files(pkgname)
-    )
+    if layout == LAYOUT_CYTHON:
+        files: dict[Path, str] = render_cython_files(pkgname)
+    elif layout == LAYOUT_SINGLE:
+        files = render_single_file_files(pkgname)
+    elif layout == LAYOUT_PACKAGE:
+        files = render_package_files(pkgname)
+    else:
+        raise ValueError(f"Unknown layout: {layout!r}")
 
     created: list[Path] = []
     skipped: list[Path] = []
@@ -637,25 +691,35 @@ def scrub_remote_token(root: Path, user: str, pkgname: str) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments.
 
+    ``--single-file`` and ``--cython`` are mutually exclusive: both select
+    a single-module-at-the-project-root layout, and there is no meaningful
+    way to combine them.
+
     Args:
         argv: Argument list (typically ``sys.argv[1:]``).
 
     Returns:
-        The parsed ``argparse.Namespace`` with ``pkgname`` and ``single_file``.
+        The parsed ``argparse.Namespace`` with ``pkgname``, ``single_file``,
+        ``cython``, and ``git``.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
         description=(
-            "Scaffold a new Python project, create a GitHub repo, "
-            "and push the initial commit. Existing files are never "
-            "overwritten."
+            "Scaffold a new Python project. Choose the default src-layout "
+            "package, a single-file module (-s), or a Cython extension "
+            "module (-c). With -g, also create a GitHub repo and push the "
+            "initial commit. Existing files are never overwritten."
         ),
     )
     parser.add_argument(
         "pkgname",
         help="Python package / module name (also used as the directory name)",
     )
-    parser.add_argument(
+
+    # Layout selection: exactly one of the three layouts is allowed, and the
+    # two single-module variants cannot be combined.
+    layout_group = parser.add_mutually_exclusive_group()
+    layout_group.add_argument(
         "-s",
         "--single-file",
         action="store_true",
@@ -663,6 +727,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "Create a single-file module (<pkgname>.py) instead of the "
             "default src-layout package"
+        ),
+    )
+    layout_group.add_argument(
+        "-c",
+        "--cython",
+        action="store_true",
+        dest="cython",
+        help=(
+            "Create a Cython extension module (<pkgname>.pyx) with a "
+            "build-enabled setup.py. Mutually exclusive with -s."
+        ),
+    )
+
+    parser.add_argument(
+        "-g",
+        "--git",
+        action="store_true",
+        dest="git",
+        help=(
+            "Also perform git init / commit / push and create the GitHub "
+            "repository. When omitted, only the local project is scaffolded."
         ),
     )
     return parser.parse_args(argv)
@@ -677,25 +762,43 @@ def main() -> None:
     """Program entry point.
 
     Usage:
-        python init_project.py [-s|--single-file] <pkgname>
+        python init_project.py [-s|--single-file | -c|--cython] [-g|--git] <pkgname>
+
+    Without ``-g``, only the local project is scaffolded; no GitHub
+    authentication, repository creation, or git operations are performed.
+    With ``-g``, the tool also creates the remote repository (if needed)
+    and pushes the initial commit.
+
+    Layout selection:
+        * (default)     src-layout pure-Python package
+        * ``-s``        single-file ``<pkgname>.py`` module
+        * ``-c``        single-file ``<pkgname>.pyx`` Cython extension,
+                        built via a dedicated ``setup.py``
     """
     args: argparse.Namespace = parse_args(sys.argv[1:])
     pkgname: str = args.pkgname
     single_file: bool = args.single_file
+    cython: bool = args.cython
+    do_git: bool = args.git
 
     if not pkgname.isidentifier():
         raise SystemExit(f"Error: {pkgname!r} is not a valid Python identifier")
 
-    layout: str = "single-file module" if single_file else "src-layout package"
-    print(f"Scaffolding {layout} for {pkgname!r}")
+    # Mutually exclusive group guarantees at most one of these is True.
+    if cython:
+        layout: str = LAYOUT_CYTHON
+        layout_desc: str = "Cython extension module"
+    elif single_file:
+        layout = LAYOUT_SINGLE
+        layout_desc = "single-file module"
+    else:
+        layout = LAYOUT_PACKAGE
+        layout_desc = "src-layout package"
 
-    # 1. Authenticate against GitHub.
-    token: str = get_github_token()
-    user: str = get_github_user(token)
-    print(f"Authenticated as GitHub user: {user}")
+    print(f"Scaffolding {layout_desc} for {pkgname!r}")
 
-    # 2. Scaffold the local project (only creating missing files).
-    root, created, skipped = init_project(pkgname, single_file=single_file)
+    # 1. Scaffold the local project (only creating missing files).
+    root, created, skipped = init_project(pkgname, layout=layout)
     print(f"Project root: {root}")
     print(f"  created: {len(created)} file(s)")
     for path in created:
@@ -704,6 +807,19 @@ def main() -> None:
         print(f"  skipped (already exist): {len(skipped)} file(s)")
         for path in skipped:
             print(f"    = {path.relative_to(root)}")
+
+    # If -g was not passed, stop here: nothing remote, nothing git.
+    if not do_git:
+        print(
+            f"\nSkipping git init / commit / push and GitHub repo creation "
+            f"(pass -g to enable).\nLocal project ready at {root}"
+        )
+        return
+
+    # 2. Authenticate against GitHub.
+    token: str = get_github_token()
+    user: str = get_github_user(token)
+    print(f"Authenticated as GitHub user: {user}")
 
     # 3. Fetch or create the remote repository.
     get_or_create_github_repo(token, user, pkgname, private=True)

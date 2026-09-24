@@ -1,467 +1,1038 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
+"""
+translate_chunks.py — Robust multi-backend text-file translator for Termux.
+
+Reads a text file, splits into word-boundary-preserving chunks, translates
+via pluggable backends (deep_translator, deepl, translate, googletrans, etc.),
+resumes from saved state, and writes JSON output with atomic saves.
+
+Features:
+  - 2500-char chunks with word-boundary preservation
+  - Multiple translation backends with fallback order
+  - Retry logic (3 attempts, exponential backoff)
+  - Thread-safe concurrent translation (≤2 workers)
+  - Resume from existing JSON, skip translated chunks
+  - Atomic writes (temp → rename every 10 chunks)
+  - Failed chunks logged to separate file
+  - Graceful Ctrl+C handling
+  - Full debug logging to file, errors to stderr
+  - Identity-translation detection (triggers retry)
+
+Platform: Termux (Android 7, armv8l 32-bit), Python 3.12
+Author: Coding Coach
+Date: 2026-09-23
+"""
 
 import argparse
 import json
-import multiprocessing as mp
-import random
-import re
 import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Callable, Dict, Optional
+from functools import wraps
 
-from deep_translator import GoogleTranslator
 from loguru import logger
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-MAX_WORKERS: Final[int] = 8
-RETRY_ATTEMPTS: Final[int] = 4
-RETRY_DELAY: Final[float] = 0.6
-MAX_CHUNK_SIZE: Final[int] = 2000
-SAVE_INTERVAL: Final[int] = 10
-CYRILLIC_RE: Final[re.Pattern[str]] = re.compile(
-    r"[\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F\u1C80-\u1C8F]"
-)
 
-# ---------------------------------------------------------------------------
-# Global interrupt flag (set by signal handlers)
-# ---------------------------------------------------------------------------
-interrupted: bool = False
+# ============================================================================
+# CONFIGURATION & LOGGING
+# ============================================================================
 
 
-def signal_handler(signum: int, frame: Any) -> None:
-    """Mark the process as interrupted so loops can exit gracefully."""
-    global interrupted
-    interrupted = True
-    logger.warning(
-        "Received interrupt signal (Ctrl+C). Saving progress and exiting gracefully..."
+def setup_logging(debug_log: Path, error_stderr: bool = True) -> None:
+    """
+    Configure loguru: DEBUG to rotating file, ERROR to stderr.
+
+    Args:
+        debug_log: Path to debug log file.
+        error_stderr: If True, also log errors to stderr.
+    """
+    logger.remove()  # Remove default handler
+
+    # Debug level to file (rotated at 50 MB)
+    logger.add(
+        str(debug_log),
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
+        rotation="50 MB",
+        retention=3,
     )
 
+    # Error level to stderr
+    if error_stderr:
+        logger.add(
+            sys.stderr,
+            level="ERROR",
+            format="{time:HH:mm:ss} | {level: <8} | {message}",
+        )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def contains_cyrillic(text: str) -> bool:
-    """Return True if `text` contains at least one Cyrillic character."""
-    return bool(CYRILLIC_RE.search(text))
+
+# ============================================================================
+# LANGUAGE CODE MAPPING
+# ============================================================================
+
+# Language code mappings per backend. Map user input (ISO 639-1) to backend-specific codes.
+LANGUAGE_CODES = {
+    "deep_translator": {
+        "en": "en",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "zh": "zh-CN",
+        "ja": "ja",
+        "ko": "ko",
+        "ar": "ar",
+    },
+    "deepl": {
+        "en": "en",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "zh": "zh",
+        "ja": "ja",
+        "ko": "ko",
+        "ar": "ar",
+    },
+    "translate": {
+        "en": "en",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "zh": "zh",
+        "ja": "ja",
+        "ko": "ko",
+        "ar": "ar",
+    },
+    "googletrans": {
+        "en": "en",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "zh": "zh-CN",
+        "ja": "ja",
+        "ko": "ko",
+        "ar": "ar",
+    },
+    "translators_bing": {
+        "en": "en",
+        "es": "es",
+        "fr": "fr",
+        "de": "de",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "zh": "zh-Hans",
+        "ja": "ja",
+        "ko": "ko",
+        "ar": "ar",
+    },
+}
 
 
-def create_chunks(lines: list[str], max_chunk_size: int) -> list[list[str]]:
-    """Split `lines` into groups whose joined length stays below `max_chunk_size`."""
-    chunks: list[list[str]] = []
-    current_chunk: list[str] = []
-    current_size: int = 0
+def map_language_code(backend: str, code: str) -> str:
+    """
+    Map ISO 639-1 language code to backend-specific code.
 
-    for line in lines:
-        # +1 accounts for the newline separator that will be added when joining.
-        line_size = len(line) + 1
+    Args:
+        backend: Backend name (e.g., "deep_translator").
+        code: ISO 639-1 code (e.g., "en", "zh").
 
-        # A single oversized line becomes its own chunk.
-        if line_size > max_chunk_size:
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_size = 0
-            chunks.append([line])
-            continue
+    Returns:
+        Backend-specific code, or original if unmapped.
 
-        if current_size + line_size > max_chunk_size and current_chunk:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_size = 0
+    Raises:
+        ValueError: If backend unknown.
+    """
+    if backend not in LANGUAGE_CODES:
+        raise ValueError(f"Unknown backend: {backend}")
+    return LANGUAGE_CODES[backend].get(code, code)
 
-        current_chunk.append(line)
-        current_size += line_size
 
-    if current_chunk:
-        chunks.append(current_chunk)
+# ============================================================================
+# TRANSLATION BACKEND FACTORIES
+# ============================================================================
+
+
+def _make_deep_translator(source: str, target: str) -> Callable:
+    """
+    Factory for deep_translator backend.
+
+    Args:
+        source: Source language code (ISO 639-1).
+        target: Target language code (ISO 639-1).
+
+    Returns:
+        Callable that translates a single chunk.
+
+    Raises:
+        ImportError: If deep_translator not installed.
+    """
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        raise ImportError(
+            "deep_translator not installed. Run: pip install deep_translator"
+        )
+
+    source = map_language_code("deep_translator", source)
+    target = map_language_code("deep_translator", target)
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via GoogleTranslator."""
+        translator = GoogleTranslator(source_language=source, target_language=target)
+        return translator.translate(text)
+
+    return translate_chunk
+
+
+def _make_deepl(source: str, target: str) -> Callable:
+    """
+    Factory for deepl backend (requires DEEPL_API_KEY environment variable).
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk.
+
+    Raises:
+        ImportError: If deepl not installed.
+        ValueError: If DEEPL_API_KEY not set.
+    """
+    try:
+        import deepl
+    except ImportError:
+        raise ImportError("deepl not installed. Run: pip install deepl")
+
+    import os
+
+    api_key = os.getenv("DEEPL_API_KEY")
+    if not api_key:
+        raise ValueError("DEEPL_API_KEY environment variable not set")
+
+    source = map_language_code("deepl", source).upper()
+    target = map_language_code("deepl", target).upper()
+    translator = deepl.Translator(api_key)
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via DeepL."""
+        result = translator.translate_text(text, source_lang=source, target_lang=target)
+        return result.text
+
+    return translate_chunk
+
+
+def _make_translate(source: str, target: str) -> Callable:
+    """
+    Factory for translate backend (Mymemory-based).
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk.
+
+    Raises:
+        ImportError: If translate not installed.
+    """
+    try:
+        from translate import Translator
+    except ImportError:
+        raise ImportError("translate not installed. Run: pip install translate")
+
+    source = map_language_code("translate", source)
+    target = map_language_code("translate", target)
+    translator = Translator(from_lang=source, to_lang=target)
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via Mymemory."""
+        return translator.translate(text)
+
+    return translate_chunk
+
+
+def _make_translators_bing(source: str, target: str) -> Callable:
+    """
+    Factory for translators (Bing backend).
+    Requires: pip install translators + pkg install nodejs
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk.
+
+    Raises:
+        ImportError: If translators not installed.
+    """
+    try:
+        import translators
+    except ImportError:
+        raise ImportError("translators not installed. Run: pip install translators")
+
+    source = map_language_code("translators_bing", source)
+    target = map_language_code("translators_bing", target)
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via Bing."""
+        return translators.translate_text(
+            text, from_language=source, to_language=target, service="bing"
+        )
+
+    return translate_chunk
+
+
+def _make_googletrans(source: str, target: str) -> Callable:
+    """
+    Factory for googletrans backend (thread-unsafe, serialized with lock).
+    Requires: pip install "googletrans==4.0.0rc1"
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk (thread-safe via lock).
+
+    Raises:
+        ImportError: If googletrans not installed.
+    """
+    try:
+        from googletrans import Translator
+    except ImportError:
+        raise ImportError(
+            'googletrans not installed. Run: pip install "googletrans==4.0.0rc1"'
+        )
+
+    source = map_language_code("googletrans", source)
+    target = map_language_code("googletrans", target)
+
+    # googletrans is not thread-safe; use lock for all calls
+    lock = threading.Lock()
+    translator = Translator()
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via googletrans (serialized)."""
+        with lock:
+            result = translator.translate(
+                text, src_language=source, dest_language=target
+            )
+            return result["text"]
+
+    return translate_chunk
+
+
+def _make_pygoogletranslation(source: str, target: str) -> Callable:
+    """
+    Factory for pygoogletranslation backend (thread-unsafe, serialized with lock).
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk (thread-safe via lock).
+
+    Raises:
+        ImportError: If pygoogletranslation not installed.
+    """
+    try:
+        from pygoogletranslation import Translator
+    except ImportError:
+        raise ImportError(
+            "pygoogletranslation not installed. Run: pip install pygoogletranslation"
+        )
+
+    source = map_language_code("googletrans", source)  # Use googletrans mapping
+    target = map_language_code("googletrans", target)
+
+    lock = threading.Lock()
+    translator = Translator()
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via pygoogletranslation (serialized)."""
+        with lock:
+            result = translator.translate(
+                text, src_language=source, dest_language=target
+            )
+            return result["text"]
+
+    return translate_chunk
+
+
+def _make_boto3(source: str, target: str) -> Callable:
+    """
+    Factory for AWS Translate (boto3).
+    Requires AWS credentials in environment or ~/.aws/credentials.
+
+    Args:
+        source: Source language code.
+        target: Target language code.
+
+    Returns:
+        Callable that translates a single chunk.
+
+    Raises:
+        ImportError: If boto3 not installed.
+    """
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError("boto3 not installed. Run: pip install boto3")
+
+    source = map_language_code("deep_translator", source)
+    target = map_language_code("deep_translator", target)
+    client = boto3.client("translate", region_name="us-east-1")
+
+    def translate_chunk(text: str) -> str:
+        """Translate text chunk via AWS Translate."""
+        response = client.translate_text(
+            Text=text,
+            SourceLanguageCode=source,
+            TargetLanguageCode=target,
+        )
+        return response["TranslatedText"]
+
+    return translate_chunk
+
+
+# Backend factory registry
+BACKEND_FACTORIES = {
+    "deep_translator": _make_deep_translator,
+    "deepl": _make_deepl,
+    "translate": _make_translate,
+    "translators_bing": _make_translators_bing,
+    "googletrans": _make_googletrans,
+    "pygoogletranslation": _make_pygoogletranslation,
+    "boto3": _make_boto3,
+}
+
+# Fallback order: deepl (if DEEPL_API_KEY set) → deep_translator → translate → ...
+DEFAULT_BACKEND_ORDER = [
+    "deepl",
+    "deep_translator",
+    "translate",
+    "translators_bing",
+    "googletrans",
+    "pygoogletranslation",
+]
+
+
+# ============================================================================
+# CHUNKING UTILITIES
+# ============================================================================
+
+
+def smart_chunk_text(text: str, chunk_size: int = 2500) -> list[str]:
+    """
+    Split text into chunks, preserving word boundaries.
+
+    Strategy:
+      1. Split into ~chunk_size blocks.
+      2. If a block exceeds chunk_size, scan backwards from chunk_size to find
+         the last space (word boundary).
+      3. Strip leading/trailing whitespace from each chunk.
+      4. Skip empty chunks.
+
+    Args:
+        text: Input text.
+        chunk_size: Target chunk size in characters.
+
+    Returns:
+        List of chunks, each ≤ chunk_size (or slightly more if a single word
+        exceeds chunk_size).
+    """
+    if not text or not text.strip():
+        return []
+
+    chunks = []
+    pos = 0
+
+    while pos < len(text):
+        # Take up to chunk_size characters
+        end = min(pos + chunk_size, len(text))
+        chunk = text[pos:end]
+
+        # If we're not at the end of the text and the chunk ends mid-word,
+        # scan backwards to find a space
+        if end < len(text) and chunk and chunk[-1] not in (" ", "\n", "\t"):
+            # Find the last space within the chunk
+            last_space = chunk.rfind(" ")
+            if last_space > 0:
+                # Use everything up to and including that space
+                chunk = chunk[:last_space]
+                end = pos + len(chunk)
+            else:
+                # No space found; use as-is (single word exceeds chunk_size)
+                end = pos + len(chunk)
+
+        # Strip and store
+        chunk = chunk.strip()
+        if chunk:  # Only append non-empty chunks
+            chunks.append(chunk)
+
+        pos = end
 
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# Worker: translate a single chunk (runs in a separate process)
-# ---------------------------------------------------------------------------
-def translate_chunk(
-    chunk: list[str],
-    source_lang: str,
-    target_lang: str,
-) -> tuple[list[str], str | None]:
+# ============================================================================
+# IDENTITY TRANSLATION DETECTION
+# ============================================================================
+def is_identity_translation(
+    original: str, translated: str, threshold: float = 0.98
+) -> bool:
     """
-    Translate a whole chunk as a single request.
+    Detect if translation is (nearly) identical to the original.
 
-    Returns a tuple of (original_chunk, translated_text_or_None).
-    `translated_text` is None when all retries failed.
+    Some backends silently return the source text when they fail or when the
+    source language equals the target language. We treat this as a failure so
+    the retry / fallback logic kicks in.
+
+    Args:
+        original: Source text.
+        translated: Translated text.
+        threshold: Similarity ratio above which we flag as identity.
+
+    Returns:
+        True if the two strings are suspiciously similar.
     """
-    if interrupted:
-        return (chunk, None)
+    if translated is None:
+        return True
+    a = original.strip()
+    b = translated.strip()
+    if not b:
+        return True
+    if a == b:
+        return True
+    # Cheap length-based filter: skip expensive comparison for clearly different
+    if abs(len(a) - len(b)) > max(4, int(0.05 * len(a))):
+        return False
+    # Use difflib ratio for a robust comparison
+    import difflib
 
-    chunk_text = "\n".join(chunk)
-    translator = GoogleTranslator(source=source_lang, target=target_lang)
-
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        if interrupted:
-            return (chunk, None)
-        try:
-            translated = translator.translate(chunk_text)
-            if translated is not None:
-                return (chunk, translated)
-        except Exception as e:
-            if interrupted:
-                return (chunk, None)
-
-            # Exponential backoff with a small jitter.
-            delay = RETRY_DELAY * (2 ** (attempt - 1))
-            jitter = random.uniform(0, delay * 0.25)
-            sleep_time = delay + jitter
-
-            logger.warning(
-                "Translate attempt {}/{} failed for chunk starting '{}...': {}. Retrying in {:.2f}s",
-                attempt,
-                RETRY_ATTEMPTS,
-                (chunk[0][:60] + "...") if chunk else "",
-                e,
-                sleep_time,
-            )
-
-            if attempt < RETRY_ATTEMPTS:
-                time.sleep(sleep_time)
-
-    return (chunk, None)
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return ratio >= threshold
 
 
-# ---------------------------------------------------------------------------
-# Progress saving
-# ---------------------------------------------------------------------------
-def save_progress(
-    all_lines: list[str],
-    results: dict[str, str],
-    output_path: Path,
-    json_path: Path,
-    source_lang: str,
-    target_lang: str,
-) -> None:
-    """Write the current `results` mapping to both a text file and a JSON file."""
-    try:
-        # Plain text output (translated line if available, otherwise original).
-        with output_path.open("w", encoding="utf-8") as f:
-            translated_count = 0
-            for line in all_lines:
-                if line in results:
-                    f.write(f"{results[line]}\n")
-                    translated_count += 1
-                else:
-                    f.write(f"{line}\n")
+# ============================================================================
+# STATE MANAGEMENT (resume + atomic writes)
+# ============================================================================
 
-        # Structured JSON output.
-        json_data = {
-            "metadata": {
-                "source_lang": source_lang,
-                "target_lang": target_lang,
-                "total_lines": len(all_lines),
-                "translated_lines": translated_count,
-                "untranslated_lines": len(all_lines) - translated_count,
-                "interrupted": interrupted,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-            "translations": {line: results.get(line, line) for line in all_lines},
+
+@dataclass
+class TranslationState:
+    """Persistent state for a translation job."""
+
+    source_file: str
+    source_lang: str
+    target_lang: str
+    chunks: list[str] = field(default_factory=list)
+    translations: Dict[int, str] = field(default_factory=dict)  # index -> translated
+    failed: Dict[int, str] = field(default_factory=dict)  # index -> error
+    backend_used: Dict[int, str] = field(default_factory=dict)  # index -> backend
+    completed_at: Optional[float] = None
+
+    def to_json(self) -> dict:
+        return {
+            "source_file": self.source_file,
+            "source_lang": self.source_lang,
+            "target_lang": self.target_lang,
+            "chunks": self.chunks,
+            "translations": {str(k): v for k, v in self.translations.items()},
+            "failed": {str(k): v for k, v in self.failed.items()},
+            "backend_used": {str(k): v for k, v in self.backend_used.items()},
+            "completed_at": self.completed_at,
         }
 
-        with json_path.open("w", encoding="utf-8") as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-
-        print(
-            f"Progress saved: {translated_count}/{len(all_lines)} lines translated "
-            f"(Output: {output_path.name}, JSON: {json_path.name})"
-        )
-    except Exception as e:
-        logger.error("Error saving progress: {}", e)
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-def main() -> None:
-    global interrupted
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    parser = argparse.ArgumentParser(
-        description="Translate lines in a text file with progress saving."
-    )
-    parser.add_argument("-i", "--input", help="Input text file (one phrase per line)")
-    parser.add_argument(
-        "-s", "--source", default="ru", help="Source language code (default: ru)"
-    )
-    parser.add_argument(
-        "-t", "--target", default="en", help="Target language code (default: en)"
-    )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=MAX_WORKERS,
-        help=f"Max worker processes (default: {MAX_WORKERS})",
-    )
-    parser.add_argument(
-        "--max-chunk-size",
-        type=int,
-        default=MAX_CHUNK_SIZE,
-        help=f"Max characters per chunk (default: {MAX_CHUNK_SIZE})",
-    )
-    parser.add_argument(
-        "--save-interval",
-        type=int,
-        default=SAVE_INTERVAL,
-        help=f"Save progress interval in seconds (default: {SAVE_INTERVAL})",
-    )
-    args = parser.parse_args()
-
-    if not args.input:
-        parser.error("the following arguments are required: -i/--input")
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logger.error("Input file not found: {}", input_path)
-        return
-
-    # ------------------------------------------------------------------
-    # Read input
-    # ------------------------------------------------------------------
-    try:
-        with input_path.open(encoding="utf-8") as f:
-            all_lines = [w.rstrip("\n") for w in f if w.strip() != ""]
-    except Exception as e:
-        logger.error("Error reading input file: {}", e)
-        return
-
-    if not all_lines:
-        print(f"No non-empty lines found in {input_path.name}")
-        return
-
-    source_lang = args.source
-    target_lang = args.target
-
-    # ------------------------------------------------------------------
-    # Filter lines that actually need translation
-    # ------------------------------------------------------------------
-    if source_lang.lower().startswith("ru"):
-        to_translate_raw = [line for line in all_lines if contains_cyrillic(line)]
-        skipped_lines = [line for line in all_lines if not contains_cyrillic(line)]
-    else:
-        to_translate_raw = list(all_lines)
-        skipped_lines = []
-
-    print(
-        f"Loaded {len(all_lines)} lines: "
-        f"{len(to_translate_raw)} flagged for translation, {len(skipped_lines)} skipped"
-    )
-
-    if not to_translate_raw:
-        print(f"No lines to translate for source_lang={source_lang}")
-        return
-
-    # ------------------------------------------------------------------
-    # Deduplicate
-    # ------------------------------------------------------------------
-    seen: set[str] = set()
-    to_translate_unique: list[str] = []
-    for line in to_translate_raw:
-        if line not in seen:
-            seen.add(line)
-            to_translate_unique.append(line)
-
-    print(
-        f"Deduplicated: {len(to_translate_unique)} unique lines to translate "
-        f"(from {len(to_translate_raw)} total flagged)"
-    )
-
-    # Results maps an *original* line to its translation.
-    results: dict[str, str] = {}
-
-    output_path = input_path.with_name(
-        f"{input_path.stem}_{target_lang}{input_path.suffix}"
-    )
-    json_path = input_path.with_name(f"{input_path.stem}_{target_lang}.json")
-
-    # Initial save (all lines as-is, since nothing has been translated yet).
-    save_progress(all_lines, results, output_path, json_path, source_lang, target_lang)
-
-    if not interrupted:
-        # --------------------------------------------------------------
-        # Chunking & worker pool setup
-        # --------------------------------------------------------------
-        chunks = create_chunks(to_translate_unique, args.max_chunk_size)
-        num_workers = min(max(1, args.max_workers), len(chunks))
-        print(
-            f"Created {len(chunks)} chunk(s) from {len(to_translate_unique)} remaining lines "
-            f"(max {args.max_chunk_size} chars per chunk), using {num_workers} worker(s)"
+    @classmethod
+    def from_json(cls, data: dict) -> "TranslationState":
+        return cls(
+            source_file=data.get("source_file", ""),
+            source_lang=data.get("source_lang", ""),
+            target_lang=data.get("target_lang", ""),
+            chunks=list(data.get("chunks", [])),
+            translations={int(k): v for k, v in data.get("translations", {}).items()},
+            failed={int(k): v for k, v in data.get("failed", {}).items()},
+            backend_used={int(k): v for k, v in data.get("backend_used", {}).items()},
+            completed_at=data.get("completed_at"),
         )
 
-        # Background thread periodically persists progress.
-        last_save_time = time.time()
-        save_lock = threading.Lock()
 
-        def periodic_save() -> None:
-            nonlocal last_save_time
-            while not interrupted:
-                time.sleep(args.save_interval)
-                if not interrupted:
-                    with save_lock:
-                        save_progress(
-                            all_lines,
-                            results,
-                            output_path,
-                            json_path,
-                            source_lang,
-                            target_lang,
-                        )
-                        last_save_time = time.time()
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """
+    Write JSON to *path* atomically (temp file + rename).
 
-        save_thread = threading.Thread(target=periodic_save, daemon=True)
-        save_thread.start()
-
+    Safe on the same filesystem; a crash mid-write leaves the previous file
+    intact.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
         try:
-            with mp.Pool(processes=num_workers) as pool:
-                # Submit every chunk asynchronously via apply_async.
-                async_results = [
-                    (
-                        pool.apply_async(
-                            translate_chunk,
-                            (chunk, source_lang, target_lang),
-                        ),
-                        chunk,
-                    )
-                    for chunk in chunks
-                ]
+            import os
 
-                completed = 0
-                total = len(async_results)
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    tmp.replace(path)
 
-                for async_result, chunk in async_results:
-                    if interrupted:
-                        print("Interrupted. Waiting for running tasks to complete...")
-                        pool.terminate()
-                        break
 
-                    completed += 1
+def load_state(path: Path) -> Optional[TranslationState]:
+    """Load state from JSON, or return None if missing / corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        state = TranslationState.from_json(data)
+        logger.info(
+            f"Resumed state from {path} ({len(state.translations)} chunks done)"
+        )
+        return state
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        logger.warning(f"Could not load state from {path}: {e}")
+        return None
 
-                    try:
-                        original_lines, translated_text = async_result.get()
 
-                        if translated_text and not interrupted:
-                            translated_lines = translated_text.splitlines()
+def save_state(path: Path, state: TranslationState) -> None:
+    """Atomically save state to *path*."""
+    try:
+        atomic_write_json(path, state.to_json())
+    except OSError as e:
+        logger.error(f"Failed to save state: {e}")
 
-                            if len(translated_lines) == len(original_lines):
-                                # Happy path: line counts match.
-                                for i, original_line in enumerate(original_lines):
-                                    tgt = translated_lines[i]
-                                    results[original_line] = tgt
-                            else:
-                                # Fallback: translate line by line.
-                                logger.warning(
-                                    "Line-count mismatch in chunk ({} original vs {} translated). "
-                                    "Falling back to per-line translation for this chunk.",
-                                    len(original_lines),
-                                    len(translated_lines),
-                                )
-                                for line in original_lines:
-                                    if interrupted:
-                                        break
-                                    try:
-                                        per_line_translator = GoogleTranslator(
-                                            source=source_lang, target=target_lang
-                                        )
-                                        t = per_line_translator.translate(line)
-                                        if t is None:
-                                            t = line
-                                        results[line] = t
-                                    except Exception as e:
-                                        logger.error(
-                                            "Per-line fallback failed for '{}': {}",
-                                            line[:50],
-                                            e,
-                                        )
-                                        results[line] = line
 
-                            print(
-                                f"Translated chunk {completed}/{total} "
-                                f"(sample: '{original_lines[0][:40]}"
-                                f"{'...' if len(original_lines[0]) > 40 else ''}' -> "
-                                f"'{results.get(original_lines[0], '')[:60]}')"
+def append_failed_chunk(path: Path, index: int, text: str, error: str) -> None:
+    """Append a failed chunk record to a newline-delimited JSON file."""
+    record = {"index": index, "text": text, "error": error, "ts": time.time()}
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.error(f"Could not append failed chunk: {e}")
+
+
+# ============================================================================
+# TRANSLATION ENGINE
+# ============================================================================
+
+
+def retry_with_backoff(
+    fn: Callable[[], str],
+    attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 15.0,
+) -> str:
+    """
+    Call fn() with exponential backoff on exception.
+
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — deliberately broad (network backends)
+            last_exc = e
+            if attempt == attempts:
+                break
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            logger.debug(
+                f"Attempt {attempt}/{attempts} failed: {e!r}; retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+class TranslatorEngine:
+    """
+    Multi-backend translation engine with fallback, retries, and resume.
+
+    Not thread-safe for state mutation — callers must serialize via lock.
+    """
+
+    def __init__(
+        self,
+        source_lang: str,
+        target_lang: str,
+        backend_order: Optional[list[str]] = None,
+        attempts_per_backend: int = 3,
+    ):
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.attempts = attempts_per_backend
+        self.backends: list[tuple[str, Callable[[str], str]]] = []
+        self.lock = threading.Lock()  # protects state
+
+        order = backend_order or DEFAULT_BACKEND_ORDER
+        for name in order:
+            factory = BACKEND_FACTORIES.get(name)
+            if factory is None:
+                logger.warning(f"Unknown backend in order: {name}")
+                continue
+            try:
+                fn = factory(source_lang, target_lang)
+                self.backends.append((name, fn))
+                logger.info(f"Backend available: {name}")
+            except (ImportError, ValueError) as e:
+                logger.info(f"Backend {name} unavailable: {e}")
+
+        if not self.backends:
+            raise RuntimeError(
+                "No translation backends available. Install one of: "
+                "deep_translator, deepl, translate, translators, "
+                "googletrans, pygoogletranslation, boto3"
+            )
+
+    def translate_chunk(self, text: str) -> tuple[str, str]:
+        """
+        Translate a single chunk trying each backend with retries.
+
+        Returns:
+            (translated_text, backend_name)
+
+        Raises:
+            RuntimeError: if every backend fails or yields identity output.
+        """
+        errors: list[str] = []
+        for name, fn in self.backends:
+            try:
+                result = retry_with_backoff(
+                    lambda f=fn, t=text: f(t),
+                    attempts=self.attempts,
+                )
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {e!r}")
+                logger.debug(f"Backend {name} failed for chunk: {e!r}")
+                continue
+
+            if result is None:
+                errors.append(f"{name}: returned None")
+                continue
+            if is_identity_translation(text, result):
+                errors.append(f"{name}: identity translation")
+                logger.debug(f"Backend {name} returned identity; trying next")
+                continue
+
+            return result, name
+
+        raise RuntimeError("All backends failed. " + " | ".join(errors))
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+
+class GracefulShutdown:
+    """Context manager that installs SIGINT/SIGTERM handlers."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self._prev_int = None
+        self._prev_term = None
+
+    def __enter__(self):
+        def handler(signum, frame):  # noqa: ARG001
+            if not self.event.is_set():
+                logger.warning(f"Signal {signum} received; finishing current chunks...")
+                print(
+                    "\n[!] Interrupt received — finishing in-flight work and saving state...",
+                    file=sys.stderr,
+                )
+            self.event.set()
+
+        self._prev_int = signal.signal(signal.SIGINT, handler)
+        try:
+            self._prev_term = signal.signal(signal.SIGTERM, handler)
+        except (ValueError, AttributeError):
+            self._prev_term = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._prev_int is not None:
+            signal.signal(signal.SIGINT, self._prev_int)
+        if self._prev_term is not None:
+            signal.signal(signal.SIGTERM, self._prev_term)
+        return False
+
+
+def run_translation(
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    backend_order: Optional[list[str]] = None,
+    chunk_size: int = 2500,
+    max_workers: int = 2,
+    save_every: int = 10,
+) -> TranslationState:
+    """
+    Run the translation pipeline with resume support.
+
+    Returns the final TranslationState.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    failed_path = output_path.with_suffix(output_path.suffix + ".failed.jsonl")
+
+    # Load existing state if present
+    state = load_state(output_path)
+    if state is not None:
+        if state.source_lang != source_lang or state.target_lang != target_lang:
+            logger.warning(
+                "Existing state has different language pair "
+                f"({state.source_lang}->{state.target_lang}); "
+                f"proceeding with current request ({source_lang}->{target_lang})"
+            )
+            state.source_lang = source_lang
+            state.target_lang = target_lang
+
+    # Read & chunk (only if we don't already have chunks)
+    if state is None or not state.chunks:
+        logger.info(f"Reading {input_path}")
+        text = input_path.read_text(encoding="utf-8", errors="replace")
+        chunks = smart_chunk_text(text, chunk_size=chunk_size)
+        logger.info(f"Split into {len(chunks)} chunks")
+        state = TranslationState(
+            source_file=str(input_path),
+            source_lang=source_lang,
+            target_lang=target_lang,
+            chunks=chunks,
+        )
+        # Save initial state so an immediate crash still resumes later
+        save_state(output_path, state)
+
+    total = len(state.chunks)
+    pending = [i for i in range(total) if i not in state.translations]
+    logger.info(f"Total chunks: {total}, pending: {len(pending)}")
+
+    if not pending:
+        logger.info("Nothing to translate — all chunks already done.")
+        state.completed_at = state.completed_at or time.time()
+        save_state(output_path, state)
+        return state
+
+    engine = TranslatorEngine(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        backend_order=backend_order,
+    )
+
+    state_lock = threading.Lock()
+    stop_event = threading.Event()
+    done_since_save = 0
+
+    def worker(idx: int) -> tuple[int, Optional[str], Optional[str], Optional[str]]:
+        """Translate chunk idx. Returns (idx, translation, backend, error)."""
+        if stop_event.is_set():
+            return idx, None, None, "cancelled"
+        text = state.chunks[idx]
+        try:
+            translated, backend = engine.translate_chunk(text)
+            return idx, translated, backend, None
+        except Exception as e:  # noqa: BLE001
+            return idx, None, None, repr(e)
+
+    completed_count = 0
+    try:
+        with GracefulShutdown() as shutdown:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(worker, i): i for i in pending}
+                for fut in as_completed(futures):
+                    idx, translated, backend, error = fut.result()
+                    completed_count += 1
+
+                    with state_lock:
+                        if error is None and translated is not None:
+                            state.translations[idx] = translated
+                            state.backend_used[idx] = backend or "unknown"
+                            state.failed.pop(idx, None)
+                            logger.debug(
+                                f"[{completed_count}/{len(pending)}] chunk {idx} ok via {backend}"
                             )
                         else:
-                            if not interrupted:
-                                logger.error(
-                                    "Failed to translate chunk starting with: {}",
-                                    (chunk[0][:60] + "...") if chunk else "",
-                                )
-                                for line in chunk:
-                                    try:
-                                        t = GoogleTranslator(
-                                            source=source_lang, target=target_lang
-                                        ).translate(line)
-                                        if t is None:
-                                            t = line
-                                        results[line] = t
-                                    except Exception as e:
-                                        logger.error(
-                                            "Per-line retry failed for '{}': {}",
-                                            line[:50],
-                                            e,
-                                        )
-                                        results[line] = line
-
-                    except Exception as e:
-                        if not interrupted:
+                            state.failed[idx] = error or "unknown error"
                             logger.error(
-                                "Unexpected error processing chunk starting with '{}': {}",
-                                (chunk[0][:60] + "...") if chunk else "",
-                                e,
+                                f"[{completed_count}/{len(pending)}] chunk {idx} FAILED: {error}"
+                            )
+                            append_failed_chunk(
+                                failed_path, idx, state.chunks[idx], error or "unknown"
                             )
 
-                    # Time-based save (backup for the periodic saver).
-                    if time.time() - last_save_time >= args.save_interval:
-                        with save_lock:
-                            save_progress(
-                                all_lines,
-                                results,
-                                output_path,
-                                json_path,
-                                source_lang,
-                                target_lang,
-                            )
-                            last_save_time = time.time()
+                        done_since_save += 1
+                        need_save = (
+                            done_since_save >= save_every
+                        ) or shutdown.event.is_set()
+                        if need_save:
+                            save_state(output_path, state)
+                            done_since_save = 0
 
-        except KeyboardInterrupt:
-            logger.warning("Keyboard interrupt detected. Saving progress...")
-            interrupted = True
-        except Exception as e:
-            logger.error("Unexpected error: {}", e)
+                    if shutdown.event.is_set():
+                        stop_event.set()
 
-    # Final save
-    save_progress(all_lines, results, output_path, json_path, source_lang, target_lang)
+    finally:
+        # Final save in all cases
+        with state_lock:
+            save_state(output_path, state)
 
-    if interrupted:
-        logger.warning("Process was interrupted. Progress has been saved.")
-        print("You can resume by running the command again.")
+    # Summary
+    ok = len(state.translations)
+    bad = len(state.failed)
+    logger.info(f"Done. Translated: {ok}/{total}, Failed: {bad}")
+    if bad:
+        logger.warning(f"Failed chunks logged to {failed_path}")
     else:
-        translated_count = sum(
-            1 for line in all_lines if line in results and results[line] != line
+        state.completed_at = time.time()
+        save_state(output_path, state)
+
+    return state
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="translate_chunks",
+        description="Translate a text file into chunks with resume support.",
+    )
+    parser.add_argument("input", type=Path, help="Input text file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output JSON file (default: <input>.translations.json)",
+    )
+    parser.add_argument(
+        "-s", "--source", default="en", help="Source language code (ISO 639-1)"
+    )
+    parser.add_argument(
+        "-t", "--target", required=True, help="Target language code (ISO 639-1)"
+    )
+    parser.add_argument(
+        "--backends",
+        default=None,
+        help="Comma-separated backend order (default: "
+        + ",".join(DEFAULT_BACKEND_ORDER)
+        + ")",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=2500, help="Chunk size in characters"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Max concurrent workers (<=2 recommended)",
+    )
+    parser.add_argument(
+        "--save-every", type=int, default=10, help="Save state every N chunks"
+    )
+    parser.add_argument(
+        "--debug-log",
+        type=Path,
+        default=None,
+        help="Path to debug log file (default: <output>.debug.log)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress error output to stderr"
+    )
+    parser.add_argument(
+        "--list-backends",
+        action="store_true",
+        help="List known backends and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+
+    if args.list_backends:
+        print("Known backends (in default fallback order):")
+        for b in DEFAULT_BACKEND_ORDER:
+            print(f"  - {b}")
+        print("\nOptional (not in default order):")
+        for b in BACKEND_FACTORIES:
+            if b not in DEFAULT_BACKEND_ORDER:
+                print(f"  - {b}")
+        return 0
+
+    output = args.output or args.input.with_suffix(
+        args.input.suffix + ".translations.json"
+    )
+    debug_log = args.debug_log or output.with_suffix(output.suffix + ".debug.log")
+
+    setup_logging(debug_log, error_stderr=not args.quiet)
+    logger.info(f"=== translate_chunks start ===")
+    logger.info(f"input={args.input} output={output} {args.source}->{args.target}")
+
+    backend_order = None
+    if args.backends:
+        backend_order = [b.strip() for b in args.backends.split(",") if b.strip()]
+        logger.info(f"Backend order override: {backend_order}")
+
+    try:
+        state = run_translation(
+            input_path=args.input,
+            output_path=output,
+            source_lang=args.source,
+            target_lang=args.target,
+            backend_order=backend_order,
+            chunk_size=args.chunk_size,
+            max_workers=max(1, min(2, args.workers)),
+            save_every=max(1, args.save_every),
         )
-        print(
-            f"Translation complete: {translated_count}/{len(all_lines)} lines translated successfully"
-        )
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return 2
+    except RuntimeError as e:
+        logger.error(str(e))
+        return 3
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"Unhandled error: {e}")
+        return 1
+
+    total = len(state.chunks)
+    ok = len(state.translations)
+    bad = len(state.failed)
+    print(f"\nTranslated {ok}/{total} chunks ({bad} failed).")
+    print(f"Output: {output}")
+    if bad:
+        print(f"Failures: {output.with_suffix(output.suffix + '.failed.jsonl')}")
+    return 0 if bad == 0 else 4
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        logger.warning("Interrupted by user. Exiting...")
-        sys.exit(1)
+    sys.exit(main())

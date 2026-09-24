@@ -26,6 +26,7 @@ WINDOWS_PATTERNS = {
     "*.msi",
     "*.scr",
     "*.lnk",
+    "*.pyd",
     "Thumbs.db",
     "desktop.ini",
     "$RECYCLE.BIN",
