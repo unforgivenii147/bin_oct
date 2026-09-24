@@ -7,7 +7,7 @@ from pathlib import Path
 from dh import cprint, mpf
 from xorhash import get_xorhash
 
-REMOVE = "-y" in sys.argv
+REMOVE = "-r" in sys.argv
 
 
 def find_dups_optimized(root: Path):

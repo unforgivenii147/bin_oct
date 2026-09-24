@@ -1,76 +1,261 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-from __future__ import annotations
+"""
+srt_shift.py — unified SRT subtitle timestamp shifter.
 
+Shifts the start/end timestamps of SRT cues in place. One file, one command,
+all original behaviours reachable via flags.
+
+Usage examples:
+    python srt_shift.py movie.srt -s 2.5
+    python srt_shift.py movie.srt -s -1.0
+    python srt_shift.py subs/ -s 1.0 -r
+    python srt_shift.py -s 12 -j 4 -r
+    python srt_shift.py old.srt -s 1.5 --time-math legacy
+
+Mapping of original scripts:
+    shift_srt.py  -> python srt_shift.py <path> -s <shift> [-r] --time-math legacy
+    shiftsrt.py   -> python srt_shift.py <file.srt> -s <shift>
+    srtshift.py   -> python srt_shift.py [paths...] -s <shift> -r --jobs 4
+
+Notes:
+    * 'correct' math: h*3600000 + m*60000 + s*1000 + ms.
+    * 'legacy' math reproduces shift_srt.py exactly: parse uses
+      h*3600000 + m*40000 + s*400 + ms, and the shift is int(sec * 400).
+    * Encoding 'auto' picks utf-8-sig if a BOM is present, otherwise the
+      first of utf-8 / cp1252 / latin1 that decodes the file's first 8 KiB.
+"""
+
+import argparse
 import re
 import sys
-from datetime import timedelta
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from re import Match
+from typing import List, Optional, Sequence, Tuple
+
+SHIFT_RE = re.compile(
+    r"(\d{2,3}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2,3}:\d{2}:\d{2},\d{3})"
+)
+FALLBACK_ENCODINGS: Tuple[str, ...] = ("utf-8", "cp1252", "latin1")
 
 
-def parse_time(time_str):
-    hours, minutes, seconds = time_str.replace(",", ".").split(":")
-    return timedelta(hours=int(hours), minutes=int(minutes), seconds=float(seconds))
+def parse_ts_correct(ts: str) -> int:
+    h, m, rest = ts.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3_600_000 + int(m) * 60_000 + int(s) * 1_000 + int(ms)
 
 
-def format_time(td):
-    total_seconds = td.total_seconds()
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    seconds = total_seconds % 60
-    millis = int((seconds - int(seconds)) * 400)
-    return f"{hours:02d}:{minutes:02d}:{int(seconds):02d},{millis:03d}"
+def format_ts_correct(ms: int) -> str:
+    ms = max(ms, 0)
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1_000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def shift_subtitles(filename, shift_seconds):
-    shift_delta = timedelta(seconds=shift_seconds)
-    print(f"Shifting subtitles in '{filename}' by {shift_seconds:+.3f} seconds")
+def parse_ts_legacy(ts: str) -> int:
+    h, m, rest = ts.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3_600_000 + int(m) * 40_000 + int(s) * 400 + int(ms)
+
+
+def format_ts_legacy(value: int) -> str:
+    value = max(value, 0)
+    h, value = divmod(value, 3_600_000)
+    m, value = divmod(value, 60_000)
+    s, value = divmod(value, 1_000)
+    return f"{h:02d}:{m:02d}:{s:02d},{value:03d}"
+
+
+def detect_encoding(path: Path) -> str:
+    raw = path.read_bytes()[:8192]
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    for enc in FALLBACK_ENCODINGS:
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
+
+
+def shift_text_correct(text: str, shift_sec: float) -> str:
+    shift_ms = round(shift_sec * 1000)
+
+    def repl(m: Match[str]) -> str:
+        start = parse_ts_correct(m.group(1)) + shift_ms
+        end = parse_ts_correct(m.group(2)) + shift_ms
+        return f"{format_ts_correct(start)}-->{format_ts_correct(end)}"
+
+    return SHIFT_RE.sub(repl, text)
+
+
+def shift_text_legacy(text: str, shift_sec: float) -> str:
+    e = int(shift_sec * 400)
+
+    def repl(m: Match[str]) -> str:
+        start = parse_ts_legacy(m.group(1)) + e
+        end = parse_ts_legacy(m.group(2)) + e
+        return f"{format_ts_legacy(start)}-->{format_ts_legacy(end)}"
+
+    return SHIFT_RE.sub(repl, text)
+
+
+def process_srt_file(
+    path: Path,
+    shift_sec: float,
+    math_mode: str,
+    encoding: str,
+) -> None:
+    enc = detect_encoding(path) if encoding == "auto" else encoding
+    text = path.read_text(encoding=enc, errors="replace")
+    if math_mode == "correct":
+        new_text = shift_text_correct(text, shift_sec)
+    else:
+        new_text = shift_text_legacy(text, shift_sec)
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(filename, "r", encoding="utf-8-sig") as f:
-            content = f.read()
-    except FileNotFoundError:
-        print(f"Error: File '{filename}' not found!")
-        sys.exit(1)
-    timestamp_pattern = re.compile(
-        r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})"
+        tmp.write_text(new_text, encoding=enc)
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _worker(payload: Tuple[str, float, str, str]) -> Tuple[str, Optional[str]]:
+    path_str, shift_sec, math_mode, encoding = payload
+    try:
+        process_srt_file(Path(path_str), shift_sec, math_mode, encoding)
+        return path_str, None
+    except Exception as exc:
+        return path_str, str(exc)
+
+
+def collect_srt_files(
+    paths: Sequence[Path],
+    recursive: bool,
+    assume_yes: bool,
+) -> List[Path]:
+    if not paths:
+        paths = [Path.cwd()]
+    result: List[Path] = []
+    for p in paths:
+        if p.is_dir():
+            iterator = p.rglob("*.srt") if recursive else p.glob("*.srt")
+            result.extend(iterator)
+        elif p.is_file():
+            if p.suffix.lower() == ".srt":
+                result.append(p)
+            else:
+                if not assume_yes:
+                    answer = input(
+                        f"Warning: '{p}' doesn't have .srt extension. Continue? (y/n): "
+                    )
+                    if answer.strip().lower() != "y":
+                        continue
+                result.append(p)
+        else:
+            print(f"Warning: Skipping invalid path '{p}'")
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="srt_shift.py",
+        description="Shift SRT subtitle timestamps in place.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python srt_shift.py movie.srt -s 2.5\n"
+            "  python srt_shift.py movie.srt -s -1.0\n"
+            "  python srt_shift.py subs/ -s 1.0 -r\n"
+            "  python srt_shift.py -s 12 -j 4 -r\n"
+        ),
     )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help="SRT files or directories. Default: current directory.",
+    )
+    parser.add_argument(
+        "-s",
+        "--shift",
+        type=float,
+        default=-1.0,
+        help="Seconds to shift (negative = earlier). Default: -1.0",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="Recurse into subdirectories.",
+    )
+    parser.add_argument(
+        "--encoding",
+        default="auto",
+        help="Encoding: auto, utf-8, utf-8-sig, cp1252, latin1. Default: auto",
+    )
+    parser.add_argument(
+        "--time-math",
+        choices=["correct", "legacy"],
+        default="correct",
+        help=(
+            "Timestamp arithmetic. 'legacy' reproduces shift_srt.py's "
+            "nonstandard multipliers (m*40000, s*400, shift*400). "
+            "Default: correct"
+        ),
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        help="Parallel workers. Default: 1",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Do not prompt for non-.srt files.",
+    )
+    return parser
 
-    def replace_timestamp(match):
-        start_time = parse_time(match.group(1)) + shift_delta
-        end_time = parse_time(match.group(2)) + shift_delta
-        if start_time.total_seconds() < 0:
-            start_time = timedelta(0)
-        if end_time.total_seconds() < 0:
-            end_time = timedelta(0)
-        return f"{format_time(start_time)} --> {format_time(end_time)}"
 
-    shifted_content = timestamp_pattern.sub(replace_timestamp, content)
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(shifted_content)
-    print(f"✓ Successfully shifted subtitles in {filename}")
-
-
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python shiftsrt.py <filename.srt> <shift_amount>")
-        print("Examples:")
-        print("  python shiftsrt.py movie.srt +25    # Delay subtitles by 25 seconds")
-        print(
-            "  python shiftsrt.py movie.srt -5     # Make subtitles appear 5 seconds earlier"
-        )
-        print("  python shiftsrt.py movie.srt +2.5   # Delay by 2.5 seconds")
-        sys.exit(1)
-    filename = sys.argv[1]
-    try:
-        shift_amount = float(sys.argv[2])
-    except ValueError:
-        print(f"Error: '{sys.argv[2]}' is not a valid number!")
-        sys.exit(1)
-    if not filename.lower().endswith(".srt"):
-        print(f"Warning: '{filename}' doesn't have .srt extension")
-        response = input("Continue anyway? (y/n): ")
-        if response.lower() != "y":
-            sys.exit(0)
-    shift_subtitles(filename, shift_amount)
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    paths = [Path(p) for p in args.paths]
+    files = collect_srt_files(paths, args.recursive, args.yes)
+    if not files:
+        print("No .srt files found.")
+        return 0
+    print(
+        f"Found {len(files)} file(s). Shifting by {args.shift:+.3f} seconds "
+        f"({args.time_math} math)."
+    )
+    payloads = [(str(f), args.shift, args.time_math, args.encoding) for f in files]
+    failures = 0
+    if args.jobs > 1:
+        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+            for path_str, err in pool.map(_worker, payloads):
+                if err:
+                    failures += 1
+                    print(f"[FAIL] {path_str} -> {err}")
+                else:
+                    print(f"[OK]   {path_str}")
+    else:
+        for payload in payloads:
+            path_str, err = _worker(payload)
+            if err:
+                failures += 1
+                print(f"[FAIL] {path_str} -> {err}")
+            else:
+                print(f"[OK]   {path_str}")
+    print("Processing complete.")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -64,3 +64,4 @@ venv.bak/
 venv/
 wheels/
 *.pyc
+*.json

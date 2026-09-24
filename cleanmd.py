@@ -78,17 +78,17 @@ class ProcessingConfig:
 
 class MarkdownPatterns:
     INLINE_IMAGE = re.compile(r"!\[([^\[\]]*)\]\(([^\)]+)\)", re.MULTILINE)
-    HTML_IMG_TAG = re.compile(
-        r"<img\s+[^>]*src=['\"]?([^'\">\s]+)['\"]?[^>]*/?>\s*",
-        re.IGNORECASE | re.MULTILINE,
-    )
+    HTML_IMG_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE | re.MULTILINE)
     REFERENCE_IMAGE = re.compile(r"!\[([^\[\]]*)\]\[([^\[\]]+)\]", re.MULTILINE)
     IMAGE_DEF = re.compile(
         r"^\s*\[([^\[\]]+)\]:\s*(.+?(?:\.(?:png|jpg|jpeg|gif|webp|svg|bmp))?)\s*(?:\"[^\"]*\")?\s*$",
         re.MULTILINE | re.IGNORECASE,
     )
-    PICTURE_TAG = re.compile(r"<picture\s*>.*?</picture>", re.DOTALL | re.IGNORECASE)
-    FIGURE_TAG = re.compile(r"<figure\s*>.*?</figure>", re.DOTALL | re.IGNORECASE)
+    PICTURE_TAG = re.compile(
+        r"<picture\b[^>]*>.*?</picture>", re.DOTALL | re.IGNORECASE
+    )
+    FIGURE_TAG = re.compile(r"<figure\b[^>]*>.*?</figure>", re.DOTALL | re.IGNORECASE)
+    EMPTY_LINK = re.compile(r"\[\]\(([^\)]+)\)", re.MULTILINE)
 
 
 class MarkdownImageRemover:
@@ -115,8 +115,14 @@ class MarkdownImageRemover:
         count += pic_count
         content, fig_count = self._remove_pattern(content, self.patterns.FIGURE_TAG)
         count += fig_count
-        content = re.sub(r"\n\n\n+", "\n\n", content)
-        return content.rstrip() + "\n", count
+        content, empty_link_count = self._remove_pattern(
+            content, self.patterns.EMPTY_LINK
+        )
+        count += empty_link_count
+        content = re.sub(r"\n{2,}", "\n\n", content)
+        content = re.sub(r"^\n+", "", content)
+        content = re.sub(r"\n+$", "\n", content)
+        return content, count
 
     def _remove_pattern(self, content: str, pattern: re.Pattern) -> tuple[str, int]:
         matches = list(pattern.finditer(content))
@@ -129,11 +135,15 @@ class MarkdownImageRemover:
 
 def get_markdown_files(path: Path) -> list[Path]:
     if path.is_file():
-        if path.suffix.lower() in {".md", ".markdown"}:
+        if path.suffix.lower() in {".md", ".markdown", ".txt"}:
             return [path]
         return []
     if path.is_dir():
-        return list(path.rglob("*.md")) + list(path.rglob("*.markdown"))
+        return (
+            list(path.rglob("*.md"))
+            + list(path.rglob("*.markdown"))
+            + list(path.rglob("*.txt"))
+        )
     return []
 
 
@@ -147,7 +157,7 @@ def process_file(path: Path, config: ProcessingConfig) -> ImageStats:
         if cleaned_content != original_content:
             if config.backup:
                 backup_path = path.with_suffix(path.suffix + ".bak")
-                path.write_text(original_content, encoding=config.encoding)
+                backup_path.write_text(original_content, encoding=config.encoding)
             path.write_text(cleaned_content, encoding=config.encoding)
         final_size = len(cleaned_content.encode(config.encoding))
         return ImageStats(
@@ -182,7 +192,7 @@ class Reporter:
         print()
         print(Styling.style("=" * 40, Color.BRIGHT_CYAN, bold=True))
         print(
-            Styling.style("  Markdown Image Remover v1.0", Color.BRIGHT_CYAN, bold=True)
+            Styling.style("  Markdown Image Remover v1.3", Color.BRIGHT_CYAN, bold=True)
         )
         print(Styling.style("=" * 40, Color.BRIGHT_CYAN, bold=True))
         print()
@@ -197,7 +207,7 @@ class Reporter:
             return
         reduction = stats.original_size - stats.final_size
         reduction_pct = (
-            (reduction / stats.original_size * 40) if stats.original_size > 0 else 0
+            (reduction / stats.original_size * 100) if stats.original_size > 0 else 0
         )
         status = Styling.success("✓") if stats.images_removed > 0 else Styling.dim("∘")
         print(
@@ -219,7 +229,7 @@ class Reporter:
         total_final = sum(r.final_size for r in successful)
         total_reduction = total_original - total_final
         reduction_pct = (
-            (total_reduction / total_original * 40) if total_original > 0 else 0
+            (total_reduction / total_original * 100) if total_original > 0 else 0
         )
         print(f"\n{Styling.style('SUMMARY', Color.BRIGHT_CYAN, bold=True)}")
         print(
@@ -228,7 +238,7 @@ class Reporter:
         if failed:
             print(f"  Failed: {Styling.error(str(len(failed)))}")
         print(
-            f"  Total images removed: {Styling.style(str(total_images), Color.YELLOW, bold=True)}"
+            f"  Total images/links removed: {Styling.style(str(total_images), Color.YELLOW, bold=True)}"
         )
         print(
             f"  Total size reduction: {Styling.style(Reporter._format_size(total_reduction), Color.BRIGHT_GREEN)} "
@@ -260,11 +270,11 @@ def main():
             p = Path(arg)
             files.extend(get_markdown_files(p))
     if not files:
-        print(Styling.warning("No markdown files found."))
+        print(Styling.warning("No markdown or text files found."))
         sys.exit(0)
     print(
         f"Found {Styling.style(str(len(files)), Color.BRIGHT_YELLOW, bold=True)} "
-        f"markdown file(s) to process.\n"
+        f"file(s) to process.\n"
     )
     config = ProcessingConfig(workers=4)
     results = []

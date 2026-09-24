@@ -12,6 +12,8 @@ def folderize_by_extension(cwd: Path):
     root_path = Path(cwd)
     extension_stats = {}
     for path in root_path.rglob("*"):
+        if path.name == ".gitignore":
+            continue
         if ".git" in path.parts:
             continue
         if path.is_file():

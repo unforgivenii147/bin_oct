@@ -1,348 +1,544 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 """
-Prompt: Refactor a Python script that detects and keeps only the latest version of package files (.whl and .deb) in a directory tree. Use multiprocessing.Pool.apply_async with a fixed pool of 8 workers instead of concurrent.futures. Add complete type hints, docstrings, loguru logging, pathlib, and fix type checker issues. Provide CLI with mutually exclusive --deb, --wheel, --all flags, --dry-run, --dir, and --verbose.
+pkg_latest_tool.py
+
+Unified package/version cleanup and ARMv7 wheel URL filtering tool.
+
+Usage examples:
+  python pkg_latest_tool.py urls urls.txt --output latest.txt --download
+  python pkg_latest_tool.py clean --type wheel --dir . --dry-run --verbose
+  python pkg_latest_tool.py clean --type all --recursive --workers 8
+  python pkg_latest_tool.py metadata . --dry-run --backup-dir backup --batch-size 100
+
+Original mapping:
+  filter_latest_version.py          -> python pkg_latest_tool.py urls ...
+  keep_latest_version.py            -> python pkg_latest_tool.py clean --type wheel|deb|targz|all ...
+  keep_latest_version_metadata.py   -> python pkg_latest_tool.py metadata ...
+  klv.py                            -> python pkg_latest_tool.py clean --type wheel|deb|all --recursive ...
+
+Optional third-party dependency: packaging
+  If installed, packaging.version is used for version comparison.
+  Otherwise a stdlib fallback version key is used.
 """
 
+from __future__ import annotations
+
 import argparse
+import logging
+import multiprocessing as mp
 import re
+import shutil
 import sys
 from collections import defaultdict
-from multiprocessing import Pool
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from loguru import logger
-from packaging import version as pkg_version
+logger = logging.getLogger(__name__)
 
-# Module-level constants
-MAX_WORKERS: int = 8
-WHEEL_EXTENSION: str = ".whl"
-DEB_EXTENSION: str = ".deb"
+ANDROID_RE = re.compile(r"/([^/]+)-(\d+\.\d+\.\d+)-py3-none-android_24_([^/]+)\.whl")
+LINUX_RE = re.compile(
+    r"/([^/]+)-(\d+\.\d+\.\d+(?:\.\d+)?)-cp\d+-cp\d+-linux_([^/]+)\.whl"
+)
+PY_RE = re.compile(r"python3\.(\d+)")
+METADATA_RE = re.compile(r"^(.+?)-(\d[\d._]*[a-zA-Z]*[\d]*)$")
+NORMALIZE_RE = re.compile(r"[-_.]+")
+
+DEFAULT_ARM_KEYWORDS = ["armeabi_v7a", "armv7l", "linux_arm", "arm"]
+DEFAULT_WORKERS = 8
+DEFAULT_BATCH_SIZE = 100
 
 
-def parse_wheel_version(filename: str) -> tuple[str, str] | None:
-    """
-    Parse a wheel filename into package name and version.
-
-    Args:
-        filename: The wheel filename (e.g., "package-1.0.0-py3-none-any.whl").
-
-    Returns:
-        A tuple of (package_name, version) or None if parsing fails.
-    """
-    name: str = filename[:-4]
-    parts: list[str] = name.split("-")
-    if len(parts) < 5:
-        return None
-    pkg_name_parts: list[str] = []
-    version_parts: list[str] = []
-    found_version: bool = False
-    for i, part in enumerate(parts):
-        if not found_version and (
-            re.match(r"^\d", part) or part.lower() in ["v", "ver", "version"]
-        ):
-            found_version = True
-            version_parts.append(part)
-        elif not found_version:
-            pkg_name_parts.append(part)
+def fallback_version_key(v: str) -> Tuple[Any, ...]:
+    parts = re.split(r"[._-]", v)
+    key: List[Tuple[Any, ...]] = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part), ""))
         else:
-            remaining_parts: int = len(parts) - i
-            if remaining_parts <= 3:
-                break
-            version_parts.append(part)
-    if pkg_name_parts and version_parts:
-        pkg_name: str = "-".join(pkg_name_parts)
-        version: str = "-".join(version_parts)
-        return pkg_name, version
-    return None
+            m = re.match(r"^(\d*)([a-zA-Z]*)(\d*)$", part)
+            if m:
+                a, b, c = m.groups()
+                key.append((1, int(a or 0), b, int(c or 0)))
+            else:
+                key.append((2, part, "", 0))
+    return tuple(key)
 
 
-def parse_deb_version(filename: str) -> tuple[str, str] | None:
-    """
-    Parse a deb filename into package name and version.
-
-    Args:
-        filename: The deb filename (e.g., "package_1.0.0_amd64.deb").
-
-    Returns:
-        A tuple of (package_name, version) or None if parsing fails.
-    """
-    name: str = filename[:-4]
-    parts: list[str] = name.split("_")
-    if len(parts) >= 2:
-        pkg_name: str = parts[0]
-        version: str = parts[1]
-        return pkg_name, version
-    return None
-
-
-def compare_versions(ver1: str, ver2: str) -> int:
-    """
-    Compare two version strings.
-
-    Args:
-        ver1: First version string.
-        ver2: Second version string.
-
-    Returns:
-        -1 if ver1 < ver2, 1 if ver1 > ver2, 0 if equal.
-    """
+def compare_versions(a: str, b: str) -> int:
     try:
-        v1: Any = pkg_version.parse(ver1)
-        v2: Any = pkg_version.parse(ver2)
+        from packaging.version import parse
+
+        v1 = parse(a)
+        v2 = parse(b)
         if v1 < v2:
             return -1
-        elif v1 > v2:
+        if v1 > v2:
             return 1
-        else:
-            return 0
-    except Exception:
-        if ver1 < ver2:
+        return 0
+    except ImportError:
+        k1 = fallback_version_key(a)
+        k2 = fallback_version_key(b)
+        if k1 < k2:
             return -1
-        elif ver1 > ver2:
+        if k1 > k2:
             return 1
+        return 0
+    except Exception:
+        if a < b:
+            return -1
+        if a > b:
+            return 1
+        return 0
+
+
+def parse_wheel_or_metadata(name: str) -> Optional[Tuple[str, str]]:
+    if name.endswith(".whl"):
+        stem = name[:-4]
+    elif name.endswith(".metadata"):
+        stem = name[:-9]
+    else:
+        return None
+    parts = stem.split("-")
+    if len(parts) < 5:
+        return None
+    pkg_parts: List[str] = []
+    ver_parts: List[str] = []
+    in_ver = False
+    for i, part in enumerate(parts):
+        if not in_ver and (
+            re.match(r"^\d", part) or part.lower() in ("v", "ver", "version")
+        ):
+            in_ver = True
+            ver_parts.append(part)
+        elif not in_ver:
+            pkg_parts.append(part)
         else:
-            return 0
-
-
-def process_file(path: Path, file_type: str) -> tuple[str, str, Path] | None:
-    """
-    Process a single package file and extract its name and version.
-
-    Args:
-        path: Path to the package file.
-        file_type: Either "wheel" or "deb".
-
-    Returns:
-        A tuple of (package_name, version, path) or None if processing fails.
-    """
-    try:
-        filename: str = path.name
-        if file_type == "wheel" and filename.endswith(WHEEL_EXTENSION):
-            parsed: tuple[str, str] | None = parse_wheel_version(filename)
-            if parsed:
-                pkg_name, version = parsed
-                return pkg_name, version, path
-        elif file_type == "deb" and filename.endswith(DEB_EXTENSION):
-            parsed = parse_deb_version(filename)
-            if parsed:
-                pkg_name, version = parsed
-                return pkg_name, version, path
-    except Exception as e:
-        logger.error(f"Error processing {path}: {e}")
+            remaining = len(parts) - i
+            if remaining <= 3:
+                break
+            ver_parts.append(part)
+    if pkg_parts and ver_parts:
+        return "-".join(pkg_parts), "-".join(ver_parts)
     return None
 
 
-def _process_file_wrapper(args: tuple[Path, str]) -> tuple[str, str, Path] | None:
-    """
-    Wrapper for process_file to be used with multiprocessing.Pool.apply_async.
-
-    Args:
-        args: A tuple of (path, file_type).
-
-    Returns:
-        A tuple of (package_name, version, path) or None if processing fails.
-    """
-    path, file_type = args
-    return process_file(path, file_type)
-
-
-def scan_directory(
-    directory: Path, file_type: str, check_all: bool = False
-) -> dict[str, list[tuple[str, Path]]]:
-    """
-    Scan a directory for package files and group them by package name.
-
-    Args:
-        directory: The directory to scan.
-        file_type: Either "wheel", "deb", or "all".
-        check_all: If True, scan for both wheel and deb files.
-
-    Returns:
-        A dictionary mapping package names to lists of (version, path) tuples.
-    """
-    packages: dict[str, list[tuple[str, Path]]] = defaultdict(list)
-    extensions: list[str] = []
-    if check_all:
-        extensions = [WHEEL_EXTENSION, DEB_EXTENSION]
-    elif file_type == "wheel":
-        extensions = [WHEEL_EXTENSION]
-    elif file_type == "deb":
-        extensions = [DEB_EXTENSION]
-
-    files_to_process: list[Path] = []
-    for ext in extensions:
-        files_to_process.extend(directory.rglob(f"*{ext}"))
-
-    print(f"Found {len(files_to_process)} files to process...")
-
-    tasks: list[tuple[Path, str]] = []
-    for path in files_to_process:
-        if path.suffix == WHEEL_EXTENSION:
-            tasks.append((path, "wheel"))
-        elif path.suffix == DEB_EXTENSION:
-            tasks.append((path, "deb"))
-
-    with Pool(processes=MAX_WORKERS) as pool:
-        async_results = [
-            pool.apply_async(_process_file_wrapper, (task,)) for task in tasks
-        ]
-        for async_result in async_results:
-            result: tuple[str, str, Path] | None = async_result.get()
-            if result:
-                pkg_name, version, path = result
-                packages[pkg_name].append((version, path))
-
-    return packages
+def parse_targz(name: str) -> Optional[Tuple[str, str]]:
+    if name.endswith(".tar.gz"):
+        stem = name[:-7]
+    elif name.endswith(".tgz"):
+        stem = name[:-4]
+    else:
+        return None
+    parts = stem.split("-")
+    for i, part in enumerate(parts):
+        if re.match(r"^\d", part):
+            pkg = "-".join(parts[:i])
+            ver = "-".join(parts[i:])
+            ver = re.sub(r"\.(tar|tgz)$", "", ver)
+            if pkg and ver:
+                return pkg, ver
+    return None
 
 
-def get_latest_version(
-    versions: list[tuple[str, Path]],
-) -> tuple[str, Path] | None:
-    """
-    Get the latest version from a list of (version, path) tuples.
+def parse_deb(name: str) -> Optional[Tuple[str, str]]:
+    parts = name.split("_")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None
 
-    Args:
-        versions: A list of (version, path) tuples.
 
-    Returns:
-        The (version, path) tuple with the highest version, or None if empty.
-    """
+def normalize_package_name(name: str) -> str:
+    return NORMALIZE_RE.sub("-", name).lower()
+
+
+def parse_metadata_filename(path: Path) -> Tuple[str, str, Path]:
+    stem = path.stem
+    m = METADATA_RE.match(stem)
+    if not m:
+        logger.warning("Could not parse version from %s", path.name)
+        return stem.lower(), "0.0.0", path
+    pkg = m.group(1).lower()
+    ver = m.group(2).replace("_", ".")
+    return pkg, ver, path
+
+
+def parse_url(url: str) -> Optional[Tuple[str, str, Tuple[int, ...], str, str]]:
+    m = ANDROID_RE.search(url)
+    if m:
+        pkg = m.group(1)
+        ver = tuple(map(int, m.group(2).split(".")))
+        arch = m.group(3)
+        return pkg, "android", ver, arch, url
+    m = LINUX_RE.search(url)
+    if m:
+        pkg = m.group(1)
+        ver = tuple(map(int, m.group(2).split(".")))
+        arch = m.group(3)
+        py_m = PY_RE.search(url)
+        py = py_m.group(1) if py_m else "unknown"
+        return pkg, py, ver, arch, url
+    return None
+
+
+def extensions_for_type(file_type: str) -> Tuple[str, ...]:
+    if file_type == "wheel":
+        return (".whl", ".metadata")
+    if file_type == "deb":
+        return (".deb",)
+    if file_type == "targz":
+        return (".tar.gz", ".tgz")
+    if file_type == "all":
+        return (".whl", ".metadata", ".deb", ".tar.gz", ".tgz")
+    return (".whl", ".metadata")
+
+
+def find_files(
+    directory: Path, extensions: Sequence[str], recursive: bool
+) -> List[Path]:
+    iterator = directory.rglob("*") if recursive else directory.glob("*")
+    return [
+        p
+        for p in iterator
+        if p.is_file() and any(p.name.endswith(ext) for ext in extensions)
+    ]
+
+
+def process_clean_file(path: Path) -> Optional[Tuple[str, str, Path]]:
+    name = path.name
+    parsed: Optional[Tuple[str, str]] = None
+    if name.endswith(".whl") or name.endswith(".metadata"):
+        parsed = parse_wheel_or_metadata(name)
+    elif name.endswith(".tar.gz") or name.endswith(".tgz"):
+        parsed = parse_targz(name)
+    elif name.endswith(".deb"):
+        parsed = parse_deb(name)
+    if parsed:
+        pkg, ver = parsed
+        return pkg, ver, path
+    return None
+
+
+def process_clean_files(
+    files: List[Path], workers: int
+) -> Dict[str, List[Tuple[str, Path]]]:
+    if workers <= 1:
+        results = [process_clean_file(f) for f in files]
+    else:
+        with mp.Pool(processes=workers) as pool:
+            results = pool.map(process_clean_file, files)
+    package_map: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
+    for rec in results:
+        if rec:
+            pkg, ver, path = rec
+            package_map[pkg].append((ver, path))
+    return dict(package_map)
+
+
+def process_metadata_files(
+    files: List[Path], workers: int
+) -> Dict[str, List[Tuple[str, Path]]]:
+    if workers <= 1:
+        results = [parse_metadata_filename(f) for f in files]
+    else:
+        with mp.Pool(processes=workers) as pool:
+            results = pool.map(parse_metadata_filename, files)
+    package_map: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
+    for pkg, ver, path in results:
+        norm = normalize_package_name(pkg)
+        package_map[norm].append((ver, path))
+    return dict(package_map)
+
+
+def process_metadata_batches(
+    files: List[Path], workers: int, batch_size: int
+) -> Dict[str, List[Tuple[str, Path]]]:
+    batches = [files[i : i + batch_size] for i in range(0, len(files), batch_size)]
+    all_map: Dict[str, List[Tuple[str, Path]]] = defaultdict(list)
+    for batch in batches:
+        batch_map = process_metadata_files(batch, workers)
+        for k, v in batch_map.items():
+            all_map[k].extend(v)
+    return dict(all_map)
+
+
+def find_latest_version(versions: List[Tuple[str, Path]]) -> Optional[Tuple[str, Path]]:
     if not versions:
         return None
-    latest: tuple[str, Path] = versions[0]
-    for version, path in versions[1:]:
-        if compare_versions(version, latest[0]) > 0:
-            latest = (version, path)
-    return latest
+    best = versions[0]
+    for ver, path in versions[1:]:
+        if compare_versions(ver, best[0]) > 0:
+            best = (ver, path)
+    return best
 
 
-def keep_latest_versions(
-    packages: dict[str, list[tuple[str, Path]]], dry_run: bool = False
-) -> int:
-    """
-    Delete all but the latest version of each package.
-
-    Args:
-        packages: A dictionary mapping package names to lists of (version, path) tuples.
-        dry_run: If True, simulate deletion without actually removing files.
-
-    Returns:
-        The number of files deleted (or would be deleted in dry-run mode).
-    """
-    total_deleted: int = 0
-    for pkg_name, versions in packages.items():
+def remove_old_versions(
+    package_map: Dict[str, List[Tuple[str, Path]]],
+    dry_run: bool,
+    backup_dir: Optional[Path],
+    verbose: bool,
+) -> Tuple[int, int]:
+    deleted = 0
+    kept = 0
+    for pkg, versions in package_map.items():
         if len(versions) <= 1:
+            kept += len(versions)
             continue
-        latest: tuple[str, Path] | None = get_latest_version(versions)
+        latest = find_latest_version(versions)
         if latest is None:
             continue
-        latest_version, latest_path = latest
-        print(f"\nPackage: {pkg_name}")
-        print(f"  Latest version: {latest_version} - {latest_path.name}")
+        latest_ver, latest_path = latest
+        print(f"Package: {pkg}")
+        print(f"  Latest version: {latest_ver}-{latest_path.name}")
         print(f"  Total versions found: {len(versions)}")
-        for version, path in versions:
+        for ver, path in versions:
             if path == latest_path:
                 continue
             if dry_run:
-                print(f"  Would delete: {version} - {path.name}")
+                print(f"  Would delete: {ver}-{path.name}")
+            elif backup_dir is not None:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                dest = backup_dir / path.name
+                shutil.move(str(path), str(dest))
+                print(f"  Moved to backup: {path.name}")
+                deleted += 1
             else:
                 try:
                     path.unlink()
-                    print(f"  Deleted: {version} - {path.name}")
-                    total_deleted += 1
+                    print(f"  Deleted: {ver}-{path.name}")
+                    deleted += 1
                 except Exception as e:
-                    logger.error(f"  Error deleting {path.name}: {e}")
-    return total_deleted
+                    logger.error("  Error deleting %s: %s", path.name, e)
+        kept += 1
+    return deleted, kept
 
 
-def main() -> int:
-    """
-    Main entry point for the script.
+def cmd_urls(args: argparse.Namespace) -> int:
+    lines: List[str] = []
+    if args.input:
+        p = Path(args.input)
+        if p.exists():
+            lines = [
+                line.strip() for line in p.read_text().splitlines() if line.strip()
+            ]
+        else:
+            lines = [args.input]
+    else:
+        lines = [line.strip() for line in sys.stdin if line.strip()]
 
-    Returns:
-        Exit code (0 for success, 1 for error).
-    """
-    parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        description="Detect and keep only the latest version of package files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    groups: Dict[Tuple[str, str], Dict[str, Tuple[Tuple[int, ...], str]]] = defaultdict(
+        dict
     )
-    group: argparse._MutuallyExclusiveGroup = parser.add_mutually_exclusive_group()
-    group.add_argument("-d", "--deb", action="store_true", help="Check .deb files")
-    group.add_argument("-w", "--wheel", action="store_true", help="Check .whl files")
-    group.add_argument(
-        "-a",
-        "--all",
-        action="store_true",
-        help="Check all package types (.whl and .deb)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simulate deletion without actually removing files",
-    )
-    parser.add_argument(
-        "--dir",
-        type=str,
-        default=".",
-        help="Directory to scan (default: current directory)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show detailed information about each file",
-    )
-    args: argparse.Namespace = parser.parse_args()
+    for url in lines:
+        rec = parse_url(url)
+        if not rec:
+            continue
+        pkg, py, ver, arch, url = rec
+        if not any(k in arch.lower() for k in args.arm_keywords):
+            continue
+        key = (pkg, py)
+        if arch not in groups[key] or ver > groups[key][arch][0]:
+            groups[key][arch] = (ver, url)
 
-    if not (args.deb or args.wheel or args.all):
-        args.wheel = True
+    results: List[Dict[str, str]] = []
+    print("-" * 40)
+    print("LATEST ARMv7 (armeabi_v7a/armv7l/linux_arm) WHEELS")
+    print("-" * 40)
+    for (pkg, py), arch_map in sorted(groups.items()):
+        for arch, (ver, url) in arch_map.items():
+            ver_str = ".".join(map(str, ver))
+            print(f"\n📦 {pkg} (Python {py})")
+            print(f"   Arch: {arch}")
+            print(f"   Version: {ver_str}")
+            print(f"   URL: {url}")
+            results.append(
+                {
+                    "package": pkg,
+                    "python_version": py,
+                    "arch": arch,
+                    "version": ver_str,
+                    "url": url,
+                }
+            )
+    print("\n" + "=" * 40)
+    print(f"SUMMARY: Found {len(results)} ARMv7 wheel(s)")
+    print("-" * 40)
+    for r in results:
+        print(f"{r['package']}=={r['version']} (Python {r['python_version']})")
 
-    scan_dir: Path = Path(args.dir).resolve()
-    if not scan_dir.exists():
-        logger.error(f"Error: Directory '{scan_dir}' does not exist")
+    if args.output:
+        Path(args.output).write_text("\n".join(r["url"] for r in results) + "\n")
+        print(f"\n✓ URLs saved to {args.output}")
+
+    if args.download:
+        script = "#!/bin/bash\n\n"
+        for r in results:
+            name = r["url"].split("/")[-1]
+            script += f"echo 'Downloading {name}...'\n"
+            script += f"wget {r['url']}\n\n"
+        Path("download_armv7.sh").write_text(script)
+        print("\n✓ Download script created: download_armv7.sh")
+        print("  Run: chmod +x download_armv7.sh && ./download_armv7.sh")
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    directory = Path(args.dir).resolve()
+    if not directory.exists():
+        logger.error("Directory '%s' does not exist", directory)
         return 1
 
-    file_type: str
-    if args.all:
-        file_type = "all"
-    elif args.deb:
-        file_type = "deb"
-    else:
-        file_type = "wheel"
+    extensions = extensions_for_type(args.type)
+    files = find_files(directory, extensions, args.recursive)
 
-    print(f"Scanning directory: {scan_dir}")
-    print(f"File type: {file_type}")
+    print(f"Scanning directory: {directory}")
+    print(f"File type: {args.type}")
     if args.dry_run:
         print("DRY RUN MODE - No files will be deleted")
     print("-" * 40)
-
-    packages: dict[str, list[tuple[str, Path]]] = scan_directory(
-        scan_dir, file_type, args.all
-    )
-
-    if not packages:
+    print(f"Found {len(files)} files to process...")
+    if not files:
         print("No matching package files found.")
         return 0
 
-    print(f"\nFound {len(packages)} package(s):")
-    for pkg_name, versions in packages.items():
-        print(f"  {pkg_name}: {len(versions)} version(s)")
-        if args.verbose and len(versions) > 1:
-            for version, path in versions:
-                print(f"    - {version}: {path.name}")
+    package_map = process_clean_files(files, args.workers)
+    total_versions = sum(len(v) for v in package_map.values())
+    print(
+        f"\nFound {len(package_map)} package(s) with {total_versions} total version(s):"
+    )
+    if args.verbose:
+        for pkg, versions in package_map.items():
+            print(f"\n  {pkg}: {len(versions)} version(s)")
+            for ver, path in versions:
+                print(f"    - {ver}: {path.name}")
+    else:
+        for pkg, versions in package_map.items():
+            print(f"  {pkg}: {len(versions)} version(s)")
 
     print("\n" + "=" * 40)
-    total_deleted: int = keep_latest_versions(packages, args.dry_run)
+    backup_dir = Path(args.backup_dir) if args.backup_dir else None
+    deleted, kept = remove_old_versions(
+        package_map, args.dry_run, backup_dir, args.verbose
+    )
     print("\n" + "=" * 40)
-
-    if total_deleted == 0:
+    if deleted == 0:
         print("No files to delete. All packages have only one version.")
     elif args.dry_run:
-        print(f"Dry run complete. Would delete {total_deleted} file(s).")
+        print(f"Dry run complete. Would delete {deleted} file(s), keep {kept} file(s).")
     else:
-        print(f"Cleanup complete. Deleted {total_deleted} file(s).")
-
+        print(f"Cleanup complete. Deleted {deleted} file(s), kept {kept} file(s).")
     return 0
+
+
+def cmd_metadata(args: argparse.Namespace) -> int:
+    directory = Path(args.directory).resolve()
+    if not directory.exists():
+        logger.error("Directory '%s' does not exist", directory)
+        return 1
+
+    files = find_files(directory, (".metadata",), recursive=False)
+    print(f"Scanning directory: {directory}")
+    print(f"Found {len(files)} metadata files")
+    if not files:
+        print("No metadata files found")
+        return 0
+
+    package_map = process_metadata_batches(files, args.workers, args.batch_size)
+    print(f"Processing {len(package_map)} unique packages...")
+    if args.verbose:
+        for pkg, versions in package_map.items():
+            print(f"\n  {pkg}: {len(versions)} version(s)")
+            for ver, path in versions:
+                print(f"    - {ver}: {path.name}")
+
+    backup_dir = Path(args.backup_dir) if args.backup_dir else None
+    if backup_dir and not args.dry_run:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+    deleted, kept = remove_old_versions(
+        package_map, args.dry_run, backup_dir, args.verbose
+    )
+    print("=" * 40)
+    print("Summary:")
+    print(f"  Total metadata files: {len(files)}")
+    print(f"  Unique packages: {len(package_map)}")
+    print(f"  Files to remove: {deleted}")
+    if deleted:
+        if args.dry_run:
+            print("This was a dry run. Use without --dry-run to actually delete files.")
+        else:
+            print(
+                f"Cleanup complete. Deleted/moved {deleted} file(s), kept {kept} file(s)."
+            )
+    else:
+        print("No duplicate versions found. All packages have single versions.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Unified package/version cleanup and ARMv7 wheel URL filtering tool."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_urls = sub.add_parser("urls", help="Filter latest ARMv7 wheels from URL list")
+    p_urls.add_argument("input", nargs="?", default=None, help="Input file or URL")
+    p_urls.add_argument("--output", "-o", help="Output file to save URLs")
+    p_urls.add_argument(
+        "--download", action="store_true", help="Generate download script"
+    )
+    p_urls.add_argument(
+        "--arm-keywords",
+        nargs="+",
+        default=DEFAULT_ARM_KEYWORDS,
+        help="Architecture keywords to keep",
+    )
+    p_urls.set_defaults(func=cmd_urls)
+
+    p_clean = sub.add_parser("clean", help="Keep latest package files in a directory")
+    p_clean.add_argument(
+        "--type",
+        "-t",
+        choices=["wheel", "deb", "targz", "all"],
+        default="wheel",
+        help="Package type to clean",
+    )
+    p_clean.add_argument("--dry-run", action="store_true", help="Simulate deletion")
+    p_clean.add_argument("--dir", default=".", help="Directory to scan")
+    p_clean.add_argument(
+        "--verbose", action="store_true", help="Show detailed information"
+    )
+    p_clean.add_argument("--recursive", action="store_true", help="Scan recursively")
+    p_clean.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS, help="Worker processes"
+    )
+    p_clean.add_argument("--backup-dir", help="Move old files to backup directory")
+    p_clean.set_defaults(func=cmd_clean)
+
+    p_meta = sub.add_parser(
+        "metadata", help="Keep latest .metadata files in a directory"
+    )
+    p_meta.add_argument("directory", nargs="?", default=".", help="Directory to scan")
+    p_meta.add_argument("--dry-run", action="store_true", help="Simulate deletion")
+    p_meta.add_argument("--backup-dir", help="Move old files to backup directory")
+    p_meta.add_argument(
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size"
+    )
+    p_meta.add_argument(
+        "--workers", type=int, default=DEFAULT_WORKERS, help="Worker processes"
+    )
+    p_meta.add_argument(
+        "--verbose", action="store_true", help="Show detailed information"
+    )
+    p_meta.set_defaults(func=cmd_metadata)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    return args.func(args)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from typing import Any
 
 import gcld3
 import pycld2 as cld2
-from binaryornot import is_binary
+from dh import is_binary
 from langdetect import DetectorFactory, detect_langs
 
 DetectorFactory.seed = 0

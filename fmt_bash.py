@@ -5,11 +5,13 @@ Regenerate this script: collect files via dh.get_files under CWD, keep ``*.sh`` 
 files whose first 256 bytes start with a shell shebang (bash/sh), skip binaries via dh.is_binary, then
 run ``shfmt -w`` on each using a fixed 8-worker multiprocessing Pool selected by --pool-method
 (map, starmap, imap_unordered, apply_async); log progress and list failures with loguru.
+Optionally move failed files into an ``error`` subdirectory under CWD via -m/--move.
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 from collections.abc import Sequence
 from multiprocessing.pool import AsyncResult, Pool
 from pathlib import Path
@@ -27,6 +29,7 @@ POOL_METHODS: Final[tuple[str, ...]] = (
 )
 
 SHEBANG_READ_BYTES: Final[int] = 256
+ERROR_DIR_NAME: Final[str] = "error"
 
 FormatResult: TypeAlias = tuple[bool, str]
 
@@ -91,6 +94,50 @@ def collect_shell_files(cwd: Path) -> list[Path]:
     return [p for p in files if not is_binary(p)]
 
 
+def move_failed_files(failed: Sequence[Path], cwd: Path) -> list[Path]:
+    """Move *failed* files into ``cwd/error``; return the moved destination paths.
+
+    Files already located inside the error directory are skipped. Missing source
+    files are skipped with a warning. Name collisions are resolved by appending
+    a numeric suffix.
+    """
+    error_dir: Path = cwd / ERROR_DIR_NAME
+    error_dir.mkdir(exist_ok=True)
+
+    moved: list[Path] = []
+    for src in failed:
+        try:
+            src_resolved = src.resolve()
+        except OSError:
+            src_resolved = src
+
+        if error_dir.resolve() in src_resolved.parents:
+            logger.warning(f"Skipping move (already in error dir): {src}")
+            continue
+
+        if not src.exists():
+            logger.warning(f"Skipping move (missing): {src}")
+            continue
+
+        dest: Path = error_dir / src.name
+        if dest.exists():
+            stem: str = src.stem
+            suffix: str = src.suffix
+            counter: int = 1
+            while dest.exists():
+                dest = error_dir / f"{stem}.{counter}{suffix}"
+                counter += 1
+
+        try:
+            shutil.move(str(src), str(dest))
+            logger.info(f"Moved to error dir: {src} -> {dest}")
+            moved.append(dest)
+        except OSError as exc:
+            logger.error(f"Failed to move {src} to {dest}: {exc}")
+
+    return moved
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,6 +147,12 @@ def parse_args() -> argparse.Namespace:
         default="map",
         help="Multiprocessing pool method to use for formatting.",
     )
+    parser.add_argument(
+        "-m",
+        "--move",
+        action="store_true",
+        help=f"Move files that failed formatting into the '{ERROR_DIR_NAME}' subdirectory under CWD.",
+    )
     return parser.parse_args()
 
 
@@ -107,9 +160,10 @@ def main() -> int:
     """CLI entry point."""
     args: argparse.Namespace = parse_args()
     pool_method: str = args.pool_method
+    move_errors: bool = args.move
 
-    cwd = Path.cwd()
-    non_binary_files = collect_shell_files(cwd)
+    cwd: Path = Path.cwd()
+    non_binary_files: list[Path] = collect_shell_files(cwd)
     if not non_binary_files:
         logger.warning("No shell files found to format.")
         return 0
@@ -117,7 +171,7 @@ def main() -> int:
     file_strings: list[str] = [str(f) for f in non_binary_files]
     logger.info(f"Processing {len(file_strings)} files...")
 
-    results = _run_pool(file_strings, pool_method)
+    results: list[FormatResult] = _run_pool(file_strings, pool_method)
     failed: list[Path] = []
     for success, p_str in results:
         if not success:
@@ -130,6 +184,9 @@ def main() -> int:
         logger.warning("Failed files:")
         for f in failed:
             logger.warning(f"  - {f}")
+
+        if move_errors:
+            move_failed_files(failed, cwd)
 
     return 0
 
