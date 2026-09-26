@@ -43,7 +43,7 @@ def format_size(num_bytes: int) -> str:
     # Unreachable: the loop always returns on the last iteration.
 
 
-def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
+def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]:
     """Yield ``(DirEntry, top_level_name)`` for every regular file under *root*.
 
     Traversal is depth-first using an explicit LIFO stack plus ``os.scandir``.
@@ -54,7 +54,7 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
     Python's ``os.scandir`` implementation).
 
     Args:
-        root: Directory to walk recursively. 
+        root: Directory to walk recursively.
 
     Yields:
         Tuples of ``(DirEntry, top_level_name)`` where ``top_level_name`` is
@@ -66,20 +66,18 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
 
     Notes:
         - Symlinks (files or directories) are skipped to prevent cycles and
-          double-counting. 
+          double-counting.
 
         - Directories named ``.git`` are pruned, so the whole subtree is
-          skipped entirely. 
+          skipped entirely.
 
         - Unreadable directories (``OSError`` during ``scandir``) are silently
-          skipped, matching the original script's behavior. 
+          skipped, matching the original script's behavior.
 
     """
     # Stack of (path, top_level_name) pairs. top_level_name is None for
     # the root itself; for subdirectories it's the name of the first-level
     # subdirectory under root that contains them.
-
-
 
     stack: list[Tuple[str, Optional[str]]] = [(str(root), None)]
 
@@ -99,12 +97,13 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
                         # subdirectory's own name becomes the top_level for its
                         # contents; deeper subdirectories keep the same top_level.
 
-
-                        child_top_level = top_level if top_level is not None else entry.name
+                        child_top_level = (
+                            top_level if top_level is not None else entry.name
+                        )
                         stack.append((entry.path, child_top_level))
         except OSError:
             # Unreadable directory (permissions, vanished mid-scan, etc.):
-            # skip it silently, matching the original behavior. 
+            # skip it silently, matching the original behavior.
             continue
 
 
@@ -149,10 +148,10 @@ def print_directory_listing(
 
 
     Args:
-        dirs: Sorted list of top-level directory names. 
+        dirs: Sorted list of top-level directory names.
         sizes: Mapping of directory name to total size in bytes (only used
             when ``show_size`` is True).
-        show_size: Whether to include a total-size column. 
+        show_size: Whether to include a total-size column.
 
     """
     size_strings: dict[str, str] = {}
@@ -195,7 +194,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Collect top-level directory names (non-recursive scandir of the root,
     # skipping symlinks and .git, matching the original behavior).
 
-
     dir_names: list[str] = []
     try:
         with os.scandir(root) as entries:
@@ -214,7 +212,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     # top-level directory. This is a separate pass from the name collection
     # above (the original script did both in one pass, but here we only
     # need sizes when -s is given, so we skip the walk entirely otherwise).
-
 
     dir_sizes: dict[str, int] = {}
     if args.size:

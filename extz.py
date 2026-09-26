@@ -1,12 +1,12 @@
 #!/data/data/com.termux/files/home/.local/bin/python
 """extz.py — Report recursive per-extension file counts in the CWD, optionally
-with total sizes per extension.
-
-
+with total sizes per extension, and a per-extension filename sample column.
 
 Usage:
     python extz.py                # show per-extension file counts
     python extz.py -s            # show per-extension counts with total sizes
+    python extz.py -f            # show filename samples (2 max, or all if <3)
+    python extz.py -s -f        # both size and filename columns
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import DefaultDict, Iterator, Optional, Tuple
 
 # --------------------------------------------------------------------------
-# Shared helpers (duplicated from the original compressed script)
+# Shared helpers
 # --------------------------------------------------------------------------
 
 
@@ -27,13 +27,13 @@ def file_extension(name: str) -> str:
 
 
 
-    Implemented inline (not via ``Path``) to avoid building a Path per file
+    Implemented inline (not via ``Path````) to avoid building a Path per file
     during the recursive walk, which matters when scanning tens of thousands
     of files.
 
 
 
-    Leading dots (``.bashrc``)and trailing dots (``file.``)do not
+    Leading dots (``.bashrc````)and trailing dots (``file.````)do not
     count as extensions, matching ``Path.suffix`` behavior:
 
     - ``Path(".bashrc").suffix`` -> ``""``
@@ -45,6 +45,8 @@ def file_extension(name: str) -> str:
 
     Returns:
         The extension including the leading dot, or ``""`` if there is none.
+
+
 
     """
     dot_index = name.rfind(".")
@@ -66,6 +68,8 @@ def format_size(num_bytes: int) -> str:
     Returns:
         Human-readable size string.
 
+
+
     """
     value = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
@@ -77,7 +81,7 @@ def format_size(num_bytes: int) -> str:
     # Unreachable: the loop always returns on the last iteration.
 
 
-def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
+def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]:
     """Yield ``(DirEntry, top_level_name)`` for every regular file under *root*.
 
     Traversal is depth-first using an explicit LIFO stack plus ``os.scandir``.
@@ -90,32 +94,30 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
 
 
     Args:
-        root: Directory to walk recursively. 
+        root: Directory to walk recursively.
 
     Yields:
         Tuples of ``(DirEntry, top_level_name)`` where ``top_level_name`` is
         the name of the first-level subdirectory of *root* containing the file,
         or ``None`` when the file sits directly in *root*. This lets callers
-        bucket files per top-level directory without a second traversal. 
+        bucket files per top-level directory without a second traversal.
 
 
 
     Notes:
         - Symlinks (files or directories) are skipped to prevent cycles and
-          double-counting. 
+          double-counting.
 
         - Directories named ``.git`` are pruned, so the whole subtree is
-          skipped entirely. 
+          skipped entirely.
 
         - Unreadable directories (``OSError`` during ``scandir````) are silently
-          skipped, matching the original script's behavior. 
+          skipped, matching the original script's behavior.
 
     """
     # Stack of (path, top_level_name) pairs. top_level_name is None for
     # the root itself; for subdirectories it's the name of the first-level
     # subdirectory under root that contains them.
-
-
 
     stack: list[Tuple[str, Optional[str]]] = [(str(root), None)]
 
@@ -135,13 +137,13 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
                         # subdirectory's own name becomes the top_level for its
                         # contents; deeper subdirectories keep the same top_level.
 
-
-
-                        child_top_level = top_level if top_level is not None else entry.name
+                        child_top_level = (
+                            top_level if top_level is not None else entry.name
+                        )
                         stack.append((entry.path, child_top_level))
         except OSError:
             # Unreadable directory (permissions, vanished mid-scan, etc.):
-            # skip it silently, matching the original behavior. 
+            # skip it silently, matching the original behavior.
             continue
 
 
@@ -156,7 +158,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
     Returns:
-        Namespace with attribute: ``size``.
+        Namespace with attributes: ``size``, ``filenames``.
+
 
 
     """
@@ -169,6 +172,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="show total size per extension",
     )
+    parser.add_argument(
+        "-f",
+        "--filenames",
+        action="store_true",
+        help=(
+            "show filename samples per extension: all names if the group has "
+            "fewer than 3 files, otherwise 2 names plus '...'"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -177,20 +189,53 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------
 
 
+def _format_filename_sample(filenames: list[str], total_count: int) -> str:
+    """Format the filename sample column for one extension group.
+
+
+
+    Rules:
+        - If the group has fewer than 3 files, show all filenames joined
+          by ", ".
+        - If the group has 3+ files, show the first 2 filenames joined
+          by ", ", followed by "..." (the count column already shows how
+          many more exist).
+
+    Args:
+        filenames: List of filenames in this group (unsorted).
+        total_count: Total number of files in this group (== len(filenames)).
+
+    Returns:
+        Formatted string for the filename column.
+
+
+    """
+    if total_count < 3:
+        return ", ".join(filenames)
+    return ", ".join(filenames[:2]) + ", ..."
+
+
 def print_extension_histogram(
     counts: dict[str, int],
     sizes: dict[str, int],
+    filenames: dict[str, list[str]],
     show_size: bool,
+    show_filenames: bool,
 ) -> None:
     """Print the per-extension histogram.
 
 
 
     Args:
-        counts: Mapping of extension (or ``".no_ext"``) to file count. 
+        counts: Mapping of extension (or ``".no_ext"````) to file count.
         sizes: Mapping of extension to total size in bytes (only used
             when ``show_size`` is True).
-        show_size: Whether to include a total-size column. 
+        filenames: Mapping of extension to list of filenames (only used
+            when ``show_filenames`` is True).
+        show_size: Whether to include a total-size column.
+        show_filenames: Whether to include a filename-sample column.
+
+
 
     """
     if not counts:
@@ -199,7 +244,8 @@ def print_extension_histogram(
 
     # Column widths: extension column sized to longest extension name;
     # count column sized to largest count value; size column (if shown)
-    # sized to longest formatted size string. 
+    # sized to longest formatted size string; filename column (if shown)
+    # sized to longest formatted filename sample.
 
     ext_width = max(len(ext) for ext in counts)
     count_width = max(len(str(count)) for count in counts.values())
@@ -209,12 +255,40 @@ def print_extension_histogram(
         size_strings = {ext: format_size(sizes.get(ext, 0)) for ext in counts}
         size_width = max(len(s) for s in size_strings.values())
 
+    filename_strings: dict[str, str] = {}
+    filename_width = 0
+    if show_filenames:
+        filename_strings = {
+            ext: _format_filename_sample(filenames.get(ext, []), counts[ext])
+            for ext in counts
+        }
+        filename_width = max(len(s) for s in filename_strings.values())
+
     print("extensions found:")
     for ext, count in sorted(counts.items()):
         line = f" {ext:<{ext_width}}  {count:>{count_width}}"
         if show_size:
             line += f"  {size_strings[ext]:>{size_width}}"
+        if show_filenames:
+            line += f"  {filename_strings[ext]:<{filename_width}}"
         print(line)
+
+        # Special case: after the ".no_ext" row, print a separator line
+        # to visually set it apart from the rest of the histogram. This only
+        # happens when the ".no_ext" group exists (i.e. there are files with
+        # no extension).
+
+        if show_filenames and ext == ".no_ext":
+            print(
+                "-"
+                * (
+                    ext_width
+                    + count_width
+                    + (size_width + 2 if show_size else 0)
+                    + (filename_width + 2 if show_filenames else 0)
+                    + 4
+                )
+            )
 
 
 # --------------------------------------------------------------------------
@@ -224,7 +298,7 @@ def print_extension_histogram(
 
 def main(argv: Optional[list[str]] = None) -> None:
     """Entry point: walk the CWD recursively, count files per extension,
-    and optionally report total sizes per extension.
+    and optionally report total sizes and/or filename samples per extension.
 
 
 
@@ -237,6 +311,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     ext_counts: DefaultDict[str, int] = defaultdict(int)
     ext_sizes: DefaultDict[str, int] = defaultdict(int)
+    ext_filenames: DefaultDict[str, list[str]] = defaultdict(list)
 
     for entry, _ in walk_files(root):
         ext = file_extension(entry.name) or ".no_ext"
@@ -247,8 +322,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             except OSError:
                 continue
             ext_sizes[ext] += file_size
+        if args.filenames:
+            ext_filenames[ext].append(entry.name)
 
-    print_extension_histogram(dict(ext_counts), dict(ext_sizes), args.size)
+    print_extension_histogram(
+        dict(ext_counts),
+        dict(ext_sizes),
+        dict(ext_filenames),
+        args.size,
+        args.filenames,
+    )
 
 
 if __name__ == "__main__":
