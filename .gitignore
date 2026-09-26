@@ -65,3 +65,6 @@ venv/
 wheels/
 *.pyc
 *.json
+$1
+$2
+
