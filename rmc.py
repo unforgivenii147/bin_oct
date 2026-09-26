@@ -50,7 +50,7 @@ import argparse
 import functools
 import multiprocessing as mp
 from pathlib import Path
-
+from dh import DOC_TH1, DOC_TH2
 import libcst as cst
 
 # --------------------------------------------------------------------------
@@ -105,25 +105,7 @@ BACKUP_SUFFIX = ".pystripbak"
 
 
 def has_no_strippable_content(source: str) -> bool:
-    """Return True if `source` contains none of '#', a triple-single-quote
-    run, or a triple-double-quote run.
-
-    This is a cheap, quick-and-not-fully-precise pre-check to skip files
-    that plainly cannot contain a comment or a triple-quoted docstring, so
-    the (more expensive) LibCST parse + transform pass can be skipped
-    entirely for them.
-
-    Caveat: this is a substring check, not a tokenizer. A file containing
-    the literal text "'''" inside a single-quoted string (e.g.
-    `x = "a '''b'''"`), or a "#" inside a string, will NOT be skipped by
-    this check even though it has nothing to strip in reality; that's fine
-    since it only produces a false "maybe has something", never a false
-    "definitely has nothing" — it never causes incorrectly skipping a file
-    that does need processing. It only fails to skip some files that could
-    have been skipped, which just costs a bit of extra parse time, not
-    correctness.
-    """
-    return "#" not in source and "'''" not in source and '"""' not in source
+    return "#" not in source and DOC_TH1 not in source and DOC_TH2 not in source
 
 
 # --------------------------------------------------------------------------
@@ -182,11 +164,6 @@ def has_trailing_comment(node: cst.CSTNode) -> bool:
 def strip_indented_block_docstring(
     block: cst.IndentedBlock,
 ) -> tuple[cst.IndentedBlock, bool]:
-    """Remove the first docstring from an indented suite.
-
-    A ``pass`` statement is inserted when removing the docstring would leave
-    an invalid empty function or class body.
-    """
     if not block.body:
         return block, False
     first = block.body[0]
@@ -358,21 +335,7 @@ def find_commented_out_code_lines(source: str) -> set[int]:
 
 
 class CommentDocstringStripper(cst.CSTTransformer):
-    """Remove selected source constructs from a LibCST tree.
-
-    ``remove_all`` is the "strip everything" mode used by ``--all``. It
-    removes every comment (including protected ones), every function/class
-    docstring, and marks the module docstring for removal after the visit.
-    When ``remove_all`` is False, protected comments are preserved and the
-    module docstring is left untouched.
-
-    ``protected_code_lines`` holds physical line numbers identified by
-    `find_commented_out_code_lines` as likely commented-out code; comments
-    on those lines are never removed, regardless of any other flag,
-    including ``--all``. This takes priority over --all deliberately: the
-    goal of skipping commented-out code is safety, and --all should not be
-    able to silently defeat that safety net.
-    """
+    METADATA_DEPENDENCIES = (cst.metadata.PositionProvider,)
 
     def __init__(
         self,
