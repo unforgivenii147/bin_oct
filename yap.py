@@ -61,10 +61,9 @@ def process_file(path: str | Path, mode: str = MODE):
                 f"({format_time(etime - stime)}) | {fsz(dsz)} | {ratio:.1f}%", "cyan"
             )
             return True
-        else:
-            print(f"{path.name} ", end=" ")
-            cprint(f"({format_time(etime - stime)}) | (no change)", "grey")
-            return True
+        print(f"{path.name} ", end=" ")
+        cprint(f"({format_time(etime - stime)}) | (no change)", "grey")
+        return True
     except Exception as e:
         cprint("[ERROR]", "red", end=" ")
         print(f"{path.name}: {e}")
