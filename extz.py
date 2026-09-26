@@ -1,23 +1,56 @@
 #!/data/data/com.termux/files/home/.local/bin/python
-"""dirz.py — List top-level directories of the CWD, optionally with total sizes.
+"""extz.py — Report recursive per-extension file counts in the CWD, optionally
+with total sizes per extension.
 
 
 
 Usage:
-    python dirz.py                # list top-level dirs
-    python dirz.py -s            # list top-level dirs with total sizes
+    python extz.py                # show per-extension file counts
+    python extz.py -s            # show per-extension counts with total sizes
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+from collections import defaultdict
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
+from typing import DefaultDict, Iterator, Optional, Tuple
 
 # --------------------------------------------------------------------------
 # Shared helpers (duplicated from the original compressed script)
 # --------------------------------------------------------------------------
+
+
+def file_extension(name: str) -> str:
+    """Return the file extension, matching ``Path(name).suffix`` semantics.
+
+
+
+    Implemented inline (not via ``Path``) to avoid building a Path per file
+    during the recursive walk, which matters when scanning tens of thousands
+    of files.
+
+
+
+    Leading dots (``.bashrc``)and trailing dots (``file.``)do not
+    count as extensions, matching ``Path.suffix`` behavior:
+
+    - ``Path(".bashrc").suffix`` -> ``""``
+    - ``Path("file.").suffix`` -> ``""``
+    - ``Path("archive.tar.gz").suffix`` -> ``".gz"``
+
+    Args:
+        name: File name (not a full path).
+
+    Returns:
+        The extension including the leading dot, or ``""`` if there is none.
+
+    """
+    dot_index = name.rfind(".")
+    if 0 < dot_index < len(name) - 1:
+        return name[dot_index:]
+    return ""
 
 
 def format_size(num_bytes: int) -> str:
@@ -32,6 +65,7 @@ def format_size(num_bytes: int) -> str:
 
     Returns:
         Human-readable size string.
+
     """
     value = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
@@ -53,6 +87,8 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
     size are needed (the ``DirEntry.stat()`` result is cached internally by
     Python's ``os.scandir`` implementation).
 
+
+
     Args:
         root: Directory to walk recursively. 
 
@@ -60,7 +96,7 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
         Tuples of ``(DirEntry, top_level_name)`` where ``top_level_name`` is
         the name of the first-level subdirectory of *root* containing the file,
         or ``None`` when the file sits directly in *root*. This lets callers
-        bucket files per top-level directory without a second traversal.
+        bucket files per top-level directory without a second traversal. 
 
 
 
@@ -71,7 +107,7 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
         - Directories named ``.git`` are pruned, so the whole subtree is
           skipped entirely. 
 
-        - Unreadable directories (``OSError`` during ``scandir``) are silently
+        - Unreadable directories (``OSError`` during ``scandir````) are silently
           skipped, matching the original script's behavior. 
 
     """
@@ -100,6 +136,7 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
                         # contents; deeper subdirectories keep the same top_level.
 
 
+
                         child_top_level = top_level if top_level is not None else entry.name
                         stack.append((entry.path, child_top_level))
         except OSError:
@@ -114,22 +151,23 @@ def walk_files(root: Path) -> Iterator[Tuple[os.DirEntry, Optional[str]]]]:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Parse command-line arguments for dirz.py.
+    """Parse command-line arguments for extz.py.
 
 
 
     Returns:
         Namespace with attribute: ``size``.
 
+
     """
     parser = argparse.ArgumentParser(
-        description="List top-level directories of the CWD, optionally with total sizes.",
+        description="Report recursive per-extension file counts in the CWD.",
     )
     parser.add_argument(
         "-s",
         "--size",
         action="store_true",
-        help="show total size per directory",
+        help="show total size per extension",
     )
     return parser.parse_args(argv)
 
@@ -139,38 +177,44 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------
 
 
-def print_directory_listing(
-    dirs: list[str],
+def print_extension_histogram(
+    counts: dict[str, int],
     sizes: dict[str, int],
     show_size: bool,
 ) -> None:
-    """Print the top-level directory listing and the total count.
+    """Print the per-extension histogram.
 
 
 
     Args:
-        dirs: Sorted list of top-level directory names. 
-        sizes: Mapping of directory name to total size in bytes (only used
+        counts: Mapping of extension (or ``".no_ext"``) to file count. 
+        sizes: Mapping of extension to total size in bytes (only used
             when ``show_size`` is True).
         show_size: Whether to include a total-size column. 
 
     """
+    if not counts:
+        print("No files found.")
+        return
+
+    # Column widths: extension column sized to longest extension name;
+    # count column sized to largest count value; size column (if shown)
+    # sized to longest formatted size string. 
+
+    ext_width = max(len(ext) for ext in counts)
+    count_width = max(len(str(count)) for count in counts.values())
     size_strings: dict[str, str] = {}
     size_width = 0
-    if show_size and dirs:
-        size_strings = {name: format_size(sizes.get(name, 0)) for name in dirs}
+    if show_size:
+        size_strings = {ext: format_size(sizes.get(ext, 0)) for ext in counts}
         size_width = max(len(s) for s in size_strings.values())
 
-    for dir_name in dirs:
-        line = f"-{dir_name}"
+    print("extensions found:")
+    for ext, count in sorted(counts.items()):
+        line = f" {ext:<{ext_width}}  {count:>{count_width}}"
         if show_size:
-            line += f"  {size_strings[dir_name]:>{size_width}}"
+            line += f"  {size_strings[ext]:>{size_width}}"
         print(line)
-
-    total_line = f"total:{len(dirs)} dirs"
-    if show_size:
-        total_line += f"  {format_size(sum(sizes.values()))}"
-    print(total_line)
 
 
 # --------------------------------------------------------------------------
@@ -179,9 +223,8 @@ def print_directory_listing(
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    """Entry point: list top-level directories of the CWD, optionally with sizes.
-
-
+    """Entry point: walk the CWD recursively, count files per extension,
+    and optionally report total sizes per extension.
 
 
 
@@ -192,42 +235,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     root = Path.cwd()
 
-    # Collect top-level directory names (non-recursive scandir of the root,
-    # skipping symlinks and .git, matching the original behavior).
+    ext_counts: DefaultDict[str, int] = defaultdict(int)
+    ext_sizes: DefaultDict[str, int] = defaultdict(int)
 
-
-    dir_names: list[str] = []
-    try:
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if entry.name == ".git":
-                    continue
-                if entry.is_symlink():
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    dir_names.append(entry.name)
-    except OSError:
-        pass
-    dir_names.sort()
-
-    # If sizes are requested, walk all files once and accumulate sizes per
-    # top-level directory. This is a separate pass from the name collection
-    # above (the original script did both in one pass, but here we only
-    # need sizes when -s is given, so we skip the walk entirely otherwise).
-
-
-    dir_sizes: dict[str, int] = {}
-    if args.size:
-        for entry, top_level in walk_files(root):
-            if top_level is None:
-                continue
+    for entry, _ in walk_files(root):
+        ext = file_extension(entry.name) or ".no_ext"
+        ext_counts[ext] += 1
+        if args.size:
             try:
                 file_size = entry.stat(follow_symlinks=False).st_size
             except OSError:
                 continue
-            dir_sizes[top_level] = dir_sizes.get(top_level, 0) + file_size
+            ext_sizes[ext] += file_size
 
-    print_directory_listing(dir_names, dir_sizes, args.size)
+    print_extension_histogram(dict(ext_counts), dict(ext_sizes), args.size)
 
 
 if __name__ == "__main__":
